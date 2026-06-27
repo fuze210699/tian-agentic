@@ -36,6 +36,8 @@ import { TianAnnotate } from '../src/index';
     :pause-animations="true"
     persist-key="tian-annotate-demo"
     :enable-layout-mode="true"
+    sync-endpoint="http://localhost:4848"
+    sync-session-id="tian-annotate-demo"
   />
 </template>
 

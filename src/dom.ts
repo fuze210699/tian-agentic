@@ -38,16 +38,18 @@ export function describeElement(el: Element): string {
   return cls ? `${tag}.${cls}` : tag;
 }
 
+const INTERNAL_CLASSES = new Set(['tian-annotate-hover-outline', 'tian-annotate-multiselect-item-outline']);
+
 function firstMeaningfulClass(el: Element): string | null {
   const classes = Array.from(el.classList).filter(
-    (c) => !c.startsWith('v-') && c !== 'router-link-active' && c !== 'tian-annotate-hover-outline'
+    (c) => !c.startsWith('v-') && c !== 'router-link-active' && !INTERNAL_CLASSES.has(c)
   );
   return classes[0] ?? null;
 }
 
 export function getCssClasses(el: Element): string {
   return Array.from(el.classList)
-    .filter((c) => c !== 'tian-annotate-hover-outline')
+    .filter((c) => !INTERNAL_CLASSES.has(c))
     .join(' ');
 }
 
@@ -147,24 +149,46 @@ export function getAccessibilitySummary(el: Element): string | undefined {
 const MIN_CONTAINMENT_RATIO = 0.6;
 
 export function getElementsInRect(rect: { left: number; top: number; width: number; height: number }, maxResults = 10): Element[] {
-  const candidates = Array.from(document.querySelectorAll('*')).filter((el) => {
-    if (el === document.body || el === document.documentElement) return false;
-    if (el.closest('.tian-annotate-ignore')) return false;
+  return getElementsInRectFromCandidates(
+    Array.from(document.querySelectorAll('*')),
+    rect,
+    maxResults
+  );
+}
+
+export function collectAllElements(): Element[] {
+  return Array.from(document.querySelectorAll('*'));
+}
+
+export function getElementsInRectFromCandidates(
+  allElements: Element[],
+  rect: { left: number; top: number; width: number; height: number },
+  maxResults = 10
+): Element[] {
+  const resolved = new Set<Element>();
+
+  for (const el of allElements) {
+    if (el === document.body || el === document.documentElement) continue;
+    if (el.closest('.tian-annotate-ignore')) continue;
     const r = el.getBoundingClientRect();
-    if (r.width < 1 || r.height < 1) return false;
+    if (r.width < 1 || r.height < 1) continue;
     const overlapX = Math.max(0, Math.min(r.right, rect.left + rect.width) - Math.max(r.left, rect.left));
     const overlapY = Math.max(0, Math.min(r.bottom, rect.top + rect.height) - Math.max(r.top, rect.top));
     const overlapArea = overlapX * overlapY;
-    if (overlapArea <= 0) return false;
-    return overlapArea / (r.width * r.height) >= MIN_CONTAINMENT_RATIO;
-  });
+    if (overlapArea <= 0) continue;
+    if (overlapArea / (r.width * r.height) < MIN_CONTAINMENT_RATIO) continue;
 
-  // Drop wrappers that merely contain another matched element (e.g. don't
-  // also report <nav>/<ul> once their <li> children already matched) — keep
-  // only the most specific elements actually inside the drag area.
-  const leaves = candidates.filter(
-    (el) => !candidates.some((other) => other !== el && el.contains(other))
-  );
+    resolved.add(getMeaningfulTarget(el, { preferContainer: true }));
+  }
+
+  // Resolution above already snapped each raw hit up to its "container" via
+  // preferContainer — so if a container (e.g. a card) and one of its own
+  // sub-parts (e.g. an icon-wrap that happened to have its own background)
+  // both ended up in the set, the container is the correct single answer:
+  // drop the nested one rather than the ancestor (the opposite of the old
+  // "report only the most specific" rule, which assumed no resolution step).
+  const list = Array.from(resolved);
+  const leaves = list.filter((el) => !list.some((other) => other !== el && other.contains(el)));
 
   return leaves.slice(0, maxResults);
 }
@@ -224,10 +248,24 @@ function hasOwnText(el: Element): boolean {
  * Pass `precise: true` (e.g. wired to the Alt/Option key) to skip this and
  * return the raw target, for the rare case the resolved ancestor isn't
  * actually what the user wants.
+ *
+ * Pass `preferContainer: true` (used for multi-select grouping) to keep
+ * climbing past plain text-bearing inline elements (e.g. a `<span>` with no
+ * styling of its own) in search of the nearest *visually distinct* ancestor
+ * (interactive tag, or its own background/border/shadow) — falling back to
+ * the nearest text element only if no such container exists within
+ * `maxDepth`. Single hover/click intentionally stops at the text element
+ * itself (so "annotate this sentence" works); grouping a drag-selection
+ * needs the opposite bias, snapping to the enclosing "item" (e.g. a badge)
+ * rather than the bare text inside it.
  */
-export function getMeaningfulTarget(el: Element, options: { precise?: boolean; maxDepth?: number } = {}): Element {
+export function getMeaningfulTarget(
+  el: Element,
+  options: { precise?: boolean; maxDepth?: number; preferContainer?: boolean } = {}
+): Element {
   if (options.precise) return el;
   const maxDepth = options.maxDepth ?? 6;
+  const preferContainer = options.preferContainer ?? false;
 
   // Collapse icon-fragment nodes (<path>, <circle>, <g>, ...) up to the
   // enclosing <svg> — those fragments are never meaningful on their own.
@@ -238,21 +276,27 @@ export function getMeaningfulTarget(el: Element, options: { precise?: boolean; m
 
   let candidate = start;
   let depth = 0;
+  let textFallback: Element | null = null;
   while (depth < maxDepth) {
     const tag = candidate.tagName.toLowerCase();
     // Note: deliberately no `tag === 'svg'` shortcut here — an icon `<svg>`
     // with no fill/border of its own isn't visually distinct, so it should
     // keep climbing to whatever wraps it (typically the actual button).
-    if (INTERACTIVE_TAGS.has(tag) || hasVisualIdentity(candidate) || hasOwnText(candidate)) {
+    if (INTERACTIVE_TAGS.has(tag) || hasVisualIdentity(candidate)) {
       return candidate;
+    }
+    if (hasOwnText(candidate)) {
+      if (!preferContainer) return candidate;
+      if (!textFallback) textFallback = candidate;
     }
     const parent = candidate.parentElement;
     if (!parent || parent === document.body || parent === document.documentElement) break;
     candidate = parent;
     depth++;
   }
-  // No confidently "meaningful" ancestor found within range — fall back to
+  // No confidently "meaningful" container found within range — fall back to
+  // the nearest text-bearing element we passed (preferContainer mode), or
   // the most specific thing we have (the svg-collapsed start, or the
   // original element) rather than guessing some arbitrary outer wrapper.
-  return start;
+  return (preferContainer && textFallback) || start;
 }

@@ -12,12 +12,18 @@ import {
   getAccessibilitySummary,
   isFixedOrSticky,
   getElementsInRect,
+  getElementsInRectFromCandidates,
   getMeaningfulTarget,
   getUnionRect,
+  collectAllElements,
 } from './dom';
 import { getVueInstance, getComponentTree, getSourceFile } from './vueTree';
 import { serializeAnnotations } from './markdown';
-import type { Annotation, OutputFormat, Rect } from './types';
+import { dispatchAgent as dispatchAgentRequest, fetchAgentModels } from './sync';
+import type { Annotation, OutputFormat, Rect, ThreadMessage } from './types';
+import claudeLogo from './assets/logos/claude-color.svg?raw';
+import opencodeLogo from './assets/logos/opencode.svg?raw';
+import agentAiLogo from './assets/logos/agent-ai.svg?raw';
 
 const props = withDefaults(
   defineProps<{
@@ -25,6 +31,13 @@ const props = withDefaults(
     pauseAnimations?: boolean;
     persistKey?: string;
     enableLayoutMode?: boolean;
+    /** Base URL of a tian-agentic-be instance (e.g. "http://localhost:4848").
+     * Unset by default — annotating stays purely client-side unless a host
+     * app opts in, so existing consumers see no behavior change. */
+    syncEndpoint?: string;
+    /** Groups annotations server-side so multiple pages/host apps don't mix
+     * into the same pending list. */
+    syncSessionId?: string;
   }>(),
   { defaultFormat: 'standard', pauseAnimations: true, enableLayoutMode: false }
 );
@@ -32,24 +45,97 @@ const props = withDefaults(
 const {
   annotations,
   addAnnotation,
+  updateAnnotation,
   removeAnnotation,
   clearAll,
   setStatus,
   addThreadMessage,
-} = useTianAnnotateStore(props.persistKey);
+  startSync,
+  stopSync,
+  syncNow,
+  syncEnabled,
+} = useTianAnnotateStore(props.persistKey, {
+  endpoint: props.syncEndpoint,
+  sessionId: props.syncSessionId,
+});
 
 const active = ref(false);
 const hoverTarget = ref<Element | null>(null);
 const precise = ref(false);
 const mouseX = ref(0);
 const mouseY = ref(0);
+// Tracked explicitly because window.scrollX/scrollY aren't reactive — without
+// this, the fixed-position drag/multi-select overlays (computed from
+// document coordinates minus current scroll) would freeze at whatever scroll
+// position was last read, drifting away from the actual elements as the page
+// scrolls instead of staying glued to them.
+const scrollPos = ref({ x: 0, y: 0 });
 const format = ref<OutputFormat>(props.defaultFormat);
 const copyState = ref<'idle' | 'copied'>('idle');
+const clearState = ref<'idle' | 'cleared'>('idle');
 const mode = ref<'feedback' | 'placement' | 'rearrange'>('feedback');
 const filterStatus = ref<'all' | 'pending' | 'acknowledged' | 'resolved'>('all');
 const animationsPaused = ref(props.pauseAnimations);
 const pinsVisible = ref(true);
 const showSettings = ref(false);
+
+// Per-browser agent model preference (not per-annotation), shared across
+// sessions on this machine — separate from persistKey'd annotation storage
+// since the model choice has nothing to do with any one project's data.
+const AGENT_MODELS_STORAGE_KEY = 'tian-annotate-agent-models';
+const claudeModel = ref('');
+const opencodeModel = ref('');
+try {
+  const raw = localStorage.getItem(AGENT_MODELS_STORAGE_KEY);
+  if (raw) {
+    const saved = JSON.parse(raw);
+    claudeModel.value = saved.claude || '';
+    opencodeModel.value = saved.opencode || '';
+  }
+} catch { /* ignore corrupt data */ }
+watch([claudeModel, opencodeModel], () => {
+  try {
+    localStorage.setItem(
+      AGENT_MODELS_STORAGE_KEY,
+      JSON.stringify({ claude: claudeModel.value, opencode: opencodeModel.value })
+    );
+  } catch { /* ignore quota errors */ }
+});
+
+// Curated fallback shown if the backend can't be reached or returns nothing
+// (e.g. opencode isn't installed on the backend host) — keeps the dropdown
+// usable instead of empty.
+const FALLBACK_CLAUDE_MODELS = [
+  'claude-sonnet-4-6',
+  'claude-opus-4-8',
+  'claude-haiku-4-5-20251001',
+  'claude-fable-5',
+];
+const claudeModelOptions = ref<string[]>([]);
+const opencodeModelOptions = ref<string[]>([]);
+const modelsLoading = ref(false);
+const modelsError = ref('');
+let modelsLoaded = false;
+
+async function loadAgentModels(force = false) {
+  if (!props.syncEndpoint || (modelsLoaded && !force)) return;
+  modelsLoading.value = true;
+  modelsError.value = '';
+  const sessionId = props.syncSessionId || 'default';
+  const [claudeResult, opencodeResult] = await Promise.all([
+    fetchAgentModels(props.syncEndpoint, 'claude', sessionId),
+    fetchAgentModels(props.syncEndpoint, 'opencode', sessionId),
+  ]);
+  claudeModelOptions.value = claudeResult.models.length ? claudeResult.models : FALLBACK_CLAUDE_MODELS;
+  opencodeModelOptions.value = opencodeResult.models;
+  modelsError.value = opencodeResult.error || claudeResult.error || '';
+  modelsLoading.value = false;
+  modelsLoaded = true;
+}
+
+watch(showSettings, (val: boolean) => {
+  if (val) loadAgentModels();
+});
 
 const pendingPick = reactive<{
   el: Element | null;
@@ -96,6 +182,10 @@ const pendingPick = reactive<{
 const selectedAnnotation = ref<Annotation | null>(null);
 const threadMessage = ref('');
 const threadRole = ref<'human' | 'agent'>('human');
+const editingComment = ref(false);
+const editCommentText = ref('');
+const dispatching = ref<'claude' | 'opencode' | null>(null);
+const dispatchError = ref('');
 
 const dragStart = ref<{ x: number; y: number } | null>(null);
 const dragRect = ref<Rect | null>(null);
@@ -103,6 +193,17 @@ const dragEl = ref<Element | null>(null);
 const rearrangeClone = ref<{ el: Element; x: number; y: number } | null>(null);
 const wasDragging = ref(false);
 const multiSelectGroupRect = ref<Rect | null>(null);
+
+const liveMultiSelectEls = ref<Element[]>([]);
+let lastElementHitTestAt = 0;
+const ELEMENT_UPDATE_THROTTLE_MS = 50;
+let cachedAllElements: Element[] = [];
+
+// Shift+click multi-select: each click while Shift is held toggles 1 item
+// into the set; releasing Shift finalizes the group (same popup as
+// Shift+drag marquee select). Distinct from liveMultiSelectEls above, which
+// is for the drag-rectangle flow.
+const shiftMultiSelectEls = ref<Element[]>([]);
 
 let lastHighlighted: Element | null = null;
 let animStyle: HTMLStyleElement | null = null;
@@ -123,6 +224,15 @@ function removeAnimPause() {
   animStyle = null;
 }
 
+// ---- suppress native text selection while marquee-dragging (Shift+drag) ----
+function disableTextSelection() {
+  document.documentElement.classList.add('tian-annotate-no-select');
+  window.getSelection()?.removeAllRanges();
+}
+function enableTextSelection() {
+  document.documentElement.classList.remove('tian-annotate-no-select');
+}
+
 watch(active, (val) => {
   if (val && animationsPaused.value) injectAnimPause();
   else removeAnimPause();
@@ -133,8 +243,12 @@ watch(active, (val) => {
     rearrangeClone.value = null;
     wasDragging.value = false;
     showSettings.value = false;
+    enableTextSelection();
+    clearShiftMultiSelect();
   }
 });
+
+watch(mode, () => clearShiftMultiSelect());
 
 function toggleAnimationsPaused() {
   animationsPaused.value = !animationsPaused.value;
@@ -165,6 +279,68 @@ function clearHighlight() {
 
 function clearMultiSelectHighlight() {
   multiSelectGroupRect.value = null;
+  for (const el of liveMultiSelectEls.value) el.classList.remove('tian-annotate-multiselect-item-outline');
+  liveMultiSelectEls.value = [];
+}
+
+function clearShiftMultiSelect() {
+  for (const el of shiftMultiSelectEls.value) el.classList.remove('tian-annotate-multiselect-item-outline');
+  shiftMultiSelectEls.value = [];
+}
+
+function toggleShiftMultiSelect(el: Element) {
+  const idx = shiftMultiSelectEls.value.indexOf(el);
+  if (idx !== -1) {
+    el.classList.remove('tian-annotate-multiselect-item-outline');
+    shiftMultiSelectEls.value.splice(idx, 1);
+  } else {
+    el.classList.add('tian-annotate-multiselect-item-outline');
+    shiftMultiSelectEls.value.push(el);
+  }
+}
+
+// Shift released — turn whatever got toggled on into the same "multi-select"
+// pendingPick flow Shift+drag produces (group bounding box + nearbyElements),
+// instead of opening anything per individual click.
+function finalizeShiftMultiSelect() {
+  const els = shiftMultiSelectEls.value;
+  if (!els.length || pendingPick.el || selectedAnnotation.value) return;
+
+  const descriptions = els.map((el) => describeElement(el)).slice(0, 10);
+  multiSelectGroupRect.value = getUnionRect(els);
+  pendingPick.el = els[0];
+  pendingPick.x = Math.min(mouseX.value, window.innerWidth - 260);
+  pendingPick.y = Math.min(mouseY.value, window.innerHeight - 220);
+  pendingPick.comment = '';
+  pendingPick.intent = '';
+  pendingPick.severity = '';
+  pendingPick.selectedText = '';
+  pendingPick.isMultiSelect = true;
+  pendingPick.nearbyElements = descriptions.join(', ');
+  pendingPick.componentType = '';
+  pendingPick.placementWidth = 100;
+  pendingPick.placementHeight = 40;
+  pendingPick.placementText = '';
+  pendingPick.rearrangeLabel = '';
+  pendingPick.rearrangeSelector = '';
+  pendingPick.rearrangeTagName = '';
+  pendingPick.rearrangeOriginalRect = null;
+  pendingPick.rearrangeCurrentRect = null;
+  pendingPick.rearrangeIsFixed = false;
+
+  for (const el of els) el.classList.remove('tian-annotate-multiselect-item-outline');
+  shiftMultiSelectEls.value = [];
+}
+
+function onKeyUp(e: KeyboardEvent) {
+  if (e.key === 'Shift') finalizeShiftMultiSelect();
+}
+
+function onWindowBlur() {
+  // If Shift is released while the window doesn't have focus (e.g.
+  // Alt+Tab), no keyup ever fires — finalize on blur too so toggled items
+  // don't stay outlined forever with no way to complete the selection.
+  finalizeShiftMultiSelect();
 }
 
 // ---- event handlers ----
@@ -185,9 +361,18 @@ function onMouseDown(e: MouseEvent) {
   }
 
   if (mode.value === 'feedback') {
+    // Shift+drag means "marquee multi-select" — block native text selection
+    // from starting at all, rather than racing it. A plain drag (no Shift)
+    // is left alone so normal text selection works, picked up by onClick's
+    // window.getSelection() check for the "annotate this text" flow.
+    if (e.shiftKey) e.preventDefault();
     dragStart.value = { x: e.clientX, y: e.clientY };
     wasDragging.value = false;
   }
+}
+
+function onScroll() {
+  scrollPos.value = { x: window.scrollX, y: window.scrollY };
 }
 
 function onMouseMove(e: MouseEvent) {
@@ -206,7 +391,7 @@ function onMouseMove(e: MouseEvent) {
     return;
   }
 
-  if (dragStart.value && !dragEl.value && mode.value === 'feedback') {
+  if (dragStart.value && !dragEl.value && mode.value === 'feedback' && (e.shiftKey || wasDragging.value)) {
     const dx = e.clientX - dragStart.value.x;
     const dy = e.clientY - dragStart.value.y;
     if (Math.abs(dx) > DRAG_THRESHOLD || Math.abs(dy) > DRAG_THRESHOLD) {
@@ -215,6 +400,10 @@ function onMouseMove(e: MouseEvent) {
       // wasDragging is true) — clear that stray outline now that we know
       // this is a drag-select, not a single click.
       clearHighlight();
+      if (!wasDragging.value) {
+        disableTextSelection();
+        cachedAllElements = collectAllElements();
+      }
       wasDragging.value = true;
       const left = Math.min(dragStart.value.x, e.clientX);
       const top = Math.min(dragStart.value.y, e.clientY);
@@ -224,6 +413,24 @@ function onMouseMove(e: MouseEvent) {
         width: Math.abs(dx),
         height: Math.abs(dy),
       };
+
+      const now = performance.now();
+      if (now - lastElementHitTestAt >= ELEMENT_UPDATE_THROTTLE_MS) {
+        lastElementHitTestAt = now;
+        const els = getElementsInRectFromCandidates(cachedAllElements, {
+          left: Math.min(dragStart.value!.x, e.clientX),
+          top: Math.min(dragStart.value!.y, e.clientY),
+          width: Math.abs(dx),
+          height: Math.abs(dy),
+        });
+        for (const el of liveMultiSelectEls.value) {
+          if (!els.includes(el)) el.classList.remove('tian-annotate-multiselect-item-outline');
+        }
+        for (const el of els) {
+          if (!liveMultiSelectEls.value.includes(el)) el.classList.add('tian-annotate-multiselect-item-outline');
+        }
+        liveMultiSelectEls.value = els;
+      }
       return;
     }
   }
@@ -245,12 +452,15 @@ function onMouseMove(e: MouseEvent) {
 
 function onMouseUp(e: MouseEvent) {
   if (!active.value) return;
+  enableTextSelection();
 
   if (dragRect.value && wasDragging.value && dragRect.value.width >= DRAG_MIN_SIZE && dragRect.value.height >= DRAG_MIN_SIZE) {
     const rect = dragRect.value;
     const left = rect.x - window.scrollX;
     const top = rect.y - window.scrollY;
-    const els = getElementsInRect({ left, top, width: rect.width, height: rect.height });
+    const els = liveMultiSelectEls.value.length
+      ? liveMultiSelectEls.value
+      : getElementsInRect({ left, top, width: rect.width, height: rect.height });
     if (els.length) {
       const descriptions = els.map((el) => describeElement(el)).slice(0, 10);
       const outer = els[0];
@@ -275,6 +485,9 @@ function onMouseUp(e: MouseEvent) {
       pendingPick.rearrangeCurrentRect = null;
       pendingPick.rearrangeIsFixed = false;
     }
+    for (const el of liveMultiSelectEls.value) el.classList.remove('tian-annotate-multiselect-item-outline');
+    liveMultiSelectEls.value = [];
+    cachedAllElements = [];
     dragStart.value = null;
     dragRect.value = null;
     return;
@@ -320,6 +533,9 @@ function onMouseUp(e: MouseEvent) {
     return;
   }
 
+  for (const el of liveMultiSelectEls.value) el.classList.remove('tian-annotate-multiselect-item-outline');
+  liveMultiSelectEls.value = [];
+  cachedAllElements = [];
   dragStart.value = null;
   dragRect.value = null;
   dragEl.value = null;
@@ -330,6 +546,18 @@ function onClick(e: MouseEvent) {
   if (!active.value || isIgnored(e.target) || pendingPick.el || selectedAnnotation.value) return;
   if (wasDragging.value) {
     wasDragging.value = false;
+    return;
+  }
+
+  // Shift+click: toggle 1 item into the multi-select set instead of opening
+  // the regular single-element popup. The group finalizes on Shift keyup.
+  if (e.shiftKey && mode.value === 'feedback') {
+    e.preventDefault();
+    e.stopPropagation();
+    const el = getMeaningfulTarget(e.target as Element, { preferContainer: true });
+    if (el && el !== document.body && el !== document.documentElement) {
+      toggleShiftMultiSelect(el);
+    }
     return;
   }
 
@@ -398,6 +626,7 @@ function toggleActive() {
   if (!active.value) {
     clearHighlight();
     clearMultiSelectHighlight();
+    clearShiftMultiSelect();
     pendingPick.el = null;
     selectedAnnotation.value = null;
   }
@@ -526,14 +755,60 @@ async function copyMarkdown() {
   setTimeout(() => (copyState.value = 'idle'), 1500);
 }
 
+function handleClearAll() {
+  if (!annotations.length) return;
+  clearAll();
+  clearState.value = 'cleared';
+  setTimeout(() => (clearState.value = 'idle'), 1500);
+}
+
 function selectAnnotation(a: Annotation) {
   selectedAnnotation.value = a;
   threadMessage.value = '';
   threadRole.value = 'human';
+  editingComment.value = false;
+  dispatching.value = null;
+  dispatchError.value = '';
 }
 
 function closeDetail() {
   selectedAnnotation.value = null;
+  editingComment.value = false;
+}
+
+function startEditComment() {
+  if (!selectedAnnotation.value || selectedAnnotation.value.status === 'resolved') return;
+  editCommentText.value = selectedAnnotation.value.comment;
+  editingComment.value = true;
+}
+
+function cancelEditComment() {
+  editingComment.value = false;
+}
+
+function saveEditComment() {
+  if (!selectedAnnotation.value) return;
+  const comment = editCommentText.value.trim();
+  if (!comment) return;
+  updateAnnotation(selectedAnnotation.value.id, { comment });
+  const updated = annotations.find((a) => a.id === selectedAnnotation.value!.id);
+  if (updated) selectedAnnotation.value = updated;
+  editingComment.value = false;
+}
+
+async function runAgent(agent: 'claude' | 'opencode') {
+  if (!selectedAnnotation.value || !props.syncEndpoint || dispatching.value) return;
+  dispatching.value = agent;
+  dispatchError.value = '';
+  const model = (agent === 'claude' ? claudeModel.value : opencodeModel.value).trim();
+  const result = await dispatchAgentRequest(
+    props.syncEndpoint,
+    selectedAnnotation.value.id,
+    agent,
+    model || undefined
+  );
+  dispatching.value = null;
+  if (!result.ok) dispatchError.value = result.error || 'Failed to start agent';
 }
 
 function submitThreadMessage() {
@@ -565,11 +840,9 @@ const filteredAnnotations = computed(() => {
 
 const dragOverlayStyle = computed(() => {
   if (!dragRect.value) return {};
-  const sx = window.scrollX;
-  const sy = window.scrollY;
   return {
-    left: dragRect.value.x - sx + 'px',
-    top: dragRect.value.y - sy + 'px',
+    left: dragRect.value.x - scrollPos.value.x + 'px',
+    top: dragRect.value.y - scrollPos.value.y + 'px',
     width: dragRect.value.width + 'px',
     height: dragRect.value.height + 'px',
   };
@@ -577,11 +850,9 @@ const dragOverlayStyle = computed(() => {
 
 const multiSelectGroupOverlayStyle = computed(() => {
   if (!multiSelectGroupRect.value) return {};
-  const sx = window.scrollX;
-  const sy = window.scrollY;
   return {
-    left: multiSelectGroupRect.value.x - sx + 'px',
-    top: multiSelectGroupRect.value.y - sy + 'px',
+    left: multiSelectGroupRect.value.x - scrollPos.value.x + 'px',
+    top: multiSelectGroupRect.value.y - scrollPos.value.y + 'px',
     width: multiSelectGroupRect.value.width + 'px',
     height: multiSelectGroupRect.value.height + 'px',
   };
@@ -591,11 +862,62 @@ const annotationCountLabel = computed(
   () => `${filteredAnnotations.value.length}/${annotations.length} annotation${annotations.length === 1 ? '' : 's'}`
 );
 
+const syncEndpointHost = computed(() => {
+  if (!props.syncEndpoint) return '';
+  try {
+    return new URL(props.syncEndpoint).host;
+  } catch {
+    return props.syncEndpoint;
+  }
+});
+
+// Backend posts a "Dispatching <agent> to fix this (headless run started…)"
+// thread message when a run starts, then a "run finished"/"exited with
+// code"/"Failed to start" message when it ends (see tian-agentic-be
+// dispatch.ts). `dispatching` only covers the brief POST round-trip, not the
+// actual (multi-minute) agent run, so derive the real running state from the
+// thread itself — it stays true across reloads/polls until a finish message
+// for that dispatch shows up.
+const agentRunStatus = computed(() => {
+  if (dispatching.value) return { agent: dispatching.value };
+  const thread = selectedAnnotation.value?.thread;
+  if (!thread?.length) return null;
+  let dispatchIdx = -1;
+  for (let i = thread.length - 1; i >= 0; i--) {
+    if (/^Dispatching (\S+)/.test(thread[i].content)) {
+      dispatchIdx = i;
+      break;
+    }
+  }
+  if (dispatchIdx === -1) return null;
+  const finished = thread
+    .slice(dispatchIdx + 1)
+    .some((m: ThreadMessage) => /run finished|exited with code|Failed to start/.test(m.content));
+  if (finished) return null;
+  const match = thread[dispatchIdx].content.match(/^Dispatching (\S+)/);
+  return { agent: match ? match[1] : 'agent' };
+});
+
+function formatRelativeTime(iso: string): string {
+  const seconds = Math.max(0, Math.round((Date.now() - new Date(iso).getTime()) / 1000));
+  if (seconds < 5) return 'just now';
+  if (seconds < 60) return `${seconds}s ago`;
+  const minutes = Math.round(seconds / 60);
+  if (minutes < 60) return `${minutes}m ago`;
+  const hours = Math.round(minutes / 60);
+  return `${hours}h ago`;
+}
+
 onMounted(() => {
+  scrollPos.value = { x: window.scrollX, y: window.scrollY };
   window.addEventListener('mousedown', onMouseDown, true);
   window.addEventListener('mousemove', onMouseMove, true);
   window.addEventListener('mouseup', onMouseUp, true);
   window.addEventListener('click', onClick, true);
+  window.addEventListener('scroll', onScroll, { passive: true, capture: true });
+  window.addEventListener('keyup', onKeyUp, true);
+  window.addEventListener('blur', onWindowBlur);
+  startSync();
 });
 
 onBeforeUnmount(() => {
@@ -603,42 +925,99 @@ onBeforeUnmount(() => {
   window.removeEventListener('mousemove', onMouseMove, true);
   window.removeEventListener('mouseup', onMouseUp, true);
   window.removeEventListener('click', onClick, true);
+  window.removeEventListener('scroll', onScroll, true);
+  window.removeEventListener('keyup', onKeyUp, true);
+  window.removeEventListener('blur', onWindowBlur);
+  stopSync();
   clearHighlight();
   clearMultiSelectHighlight();
+  clearShiftMultiSelect();
   removeAnimPause();
+  enableTextSelection();
 });
 </script>
 
 <template>
   <div class="tian-annotate-toolbar tian-annotate-ignore">
     <!-- Settings popover (format level, layout mode, status filter) -->
-    <div v-if="active && showSettings" class="tian-annotate-panel">
-      <div class="tian-annotate-panel-row">
-        <span>{{ annotationCountLabel }}</span>
-        <select v-model="format">
-          <option value="compact">Compact</option>
-          <option value="standard">Standard</option>
-          <option value="detailed">Detailed</option>
-          <option value="forensic">Forensic</option>
-        </select>
-      </div>
-      <div v-if="props.enableLayoutMode" class="tian-annotate-panel-row">
-        <select v-model="mode">
-          <option value="feedback">Feedback</option>
-          <option value="placement">Placement</option>
-          <option value="rearrange">Rearrange</option>
-        </select>
-      </div>
-      <div class="tian-annotate-panel-row">
-        <select v-model="filterStatus">
-          <option value="all">All</option>
-          <option value="pending">Pending</option>
-          <option value="acknowledged">Acknowledged</option>
-          <option value="resolved">Resolved</option>
-        </select>
-      </div>
-    </div>
+    <Transition name="tian-panel">
+      <div v-if="active && showSettings" class="tian-annotate-panel">
+        <div class="tian-annotate-panel-header">
+          <span class="tian-annotate-panel-title">Settings</span>
+          <span class="tian-annotate-panel-count">{{ annotationCountLabel }}</span>
+        </div>
 
+        <div class="tian-annotate-panel-section">
+          <label class="tian-annotate-panel-label">Markdown format</label>
+          <select v-model="format" class="tian-annotate-panel-select">
+            <option value="compact">Compact</option>
+            <option value="standard">Standard</option>
+            <option value="detailed">Detailed</option>
+            <option value="forensic">Forensic</option>
+          </select>
+        </div>
+
+        <div v-if="props.enableLayoutMode" class="tian-annotate-panel-section">
+          <label class="tian-annotate-panel-label">Mode</label>
+          <select v-model="mode" class="tian-annotate-panel-select">
+            <option value="feedback">Feedback</option>
+            <option value="placement">Placement</option>
+            <option value="rearrange">Rearrange</option>
+          </select>
+        </div>
+
+        <div class="tian-annotate-panel-section">
+          <label class="tian-annotate-panel-label">Filter</label>
+          <select v-model="filterStatus" class="tian-annotate-panel-select">
+            <option value="all">All</option>
+            <option value="pending">Pending</option>
+            <option value="acknowledged">Acknowledged</option>
+            <option value="resolved">Resolved</option>
+          </select>
+        </div>
+
+        <template v-if="syncEnabled">
+          <div class="tian-annotate-panel-divider"></div>
+          <div class="tian-annotate-panel-section-title">
+            Agent models
+            <button
+              type="button"
+              class="tian-annotate-panel-refresh"
+              :disabled="modelsLoading"
+              title="Refresh model list"
+              @click="loadAgentModels(true)"
+            >{{ modelsLoading ? '…' : '↻' }}</button>
+          </div>
+
+          <div class="tian-annotate-panel-section">
+            <label class="tian-annotate-panel-label">
+              <span v-html="claudeLogo" class="tian-annotate-panel-label-icon"></span>
+              Claude
+            </label>
+            <select v-model="claudeModel" class="tian-annotate-panel-select">
+              <option value="">Default (CLI config)</option>
+              <option v-for="m in claudeModelOptions" :key="m" :value="m">{{ m }}</option>
+            </select>
+          </div>
+
+          <div class="tian-annotate-panel-section">
+            <label class="tian-annotate-panel-label">
+              <span v-html="opencodeLogo" class="tian-annotate-panel-label-icon"></span>
+              OpenCode
+            </label>
+            <select v-model="opencodeModel" class="tian-annotate-panel-select">
+              <option value="">Default (CLI config)</option>
+              <option v-for="m in opencodeModelOptions" :key="m" :value="m">{{ m }}</option>
+            </select>
+            <span v-if="!modelsLoading && !opencodeModelOptions.length" class="tian-annotate-panel-hint">
+              Couldn't fetch OpenCode models{{ modelsError ? `: ${modelsError}` : '' }}
+            </span>
+          </div>
+        </template>
+      </div>
+    </Transition>
+
+    <Transition name="tian-toolbar" mode="out-in">
     <!-- Inactive: round "+" toggle -->
     <button
       v-if="!active"
@@ -647,7 +1026,7 @@ onBeforeUnmount(() => {
       aria-label="Start annotating"
       @click="toggleActive"
     >
-      <span>+</span>
+      <span class="tian-annotate-toggle-icon" v-html="agentAiLogo"></span>
     </button>
 
     <!-- Active: pill icon bar -->
@@ -683,23 +1062,31 @@ onBeforeUnmount(() => {
       <button
         type="button"
         class="tian-annotate-icon-btn"
+        :class="{ 'is-success': copyState === 'copied' }"
         :disabled="!filteredAnnotations.length"
         aria-label="Copy markdown"
         :title="copyState === 'copied' ? 'Copied!' : 'Copy markdown'"
         @click="copyMarkdown"
       >
-        <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg>
+        <Transition name="tian-icon-pop" mode="out-in">
+          <svg v-if="copyState === 'copied'" key="check" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
+          <svg v-else key="copy" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="9" width="11" height="11" rx="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg>
+        </Transition>
       </button>
 
       <button
         type="button"
         class="tian-annotate-icon-btn"
+        :class="{ 'is-success': clearState === 'cleared' }"
         :disabled="!annotations.length"
         aria-label="Clear all annotations"
-        title="Clear all annotations"
-        @click="clearAll"
+        :title="clearState === 'cleared' ? 'Cleared!' : 'Clear all annotations'"
+        @click="handleClearAll"
       >
-        <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 01-2 2H8a2 2 0 01-2-2L5 6m3 0V4a2 2 0 012-2h4a2 2 0 012 2v2"/></svg>
+        <Transition name="tian-icon-pop" mode="out-in">
+          <svg v-if="clearState === 'cleared'" key="check" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg>
+          <svg v-else key="trash" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 01-2 2H8a2 2 0 01-2-2L5 6m3 0V4a2 2 0 012-2h4a2 2 0 012 2v2"/></svg>
+        </Transition>
       </button>
 
       <span class="tian-annotate-icon-divider" />
@@ -726,16 +1113,20 @@ onBeforeUnmount(() => {
         <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
       </button>
     </div>
+    </Transition>
   </div>
 
-  <div
-    v-if="active && hoverTarget && !pendingPick.el && !selectedAnnotation"
-    class="tian-annotate-tag tian-annotate-ignore"
-    :style="{ left: mouseX + 14 + 'px', top: mouseY + 14 + 'px' }"
-  >
-    {{ mode === 'placement' ? 'Click to place' : mode === 'rearrange' ? 'Drag to move' : describeElement(hoverTarget) }}
-    <span v-if="precise" class="tian-annotate-tag-hint"> · precise (Alt)</span>
-  </div>
+  <Transition name="tian-tag">
+    <div
+      v-if="active && hoverTarget && !pendingPick.el && !selectedAnnotation"
+      class="tian-annotate-tag tian-annotate-ignore"
+      :style="{ left: mouseX + 14 + 'px', top: mouseY + 14 + 'px' }"
+    >
+      {{ mode === 'placement' ? 'Click to place' : mode === 'rearrange' ? 'Drag to move' : describeElement(hoverTarget) }}
+      <span v-if="precise" class="tian-annotate-tag-hint"> · precise (Alt)</span>
+      <span v-if="mode === 'feedback' && !precise" class="tian-annotate-tag-hint"> · Shift+drag or Shift+click to multi-select</span>
+    </div>
+  </Transition>
 
   <!-- drag selection overlay (while still dragging) -->
   <div
@@ -764,11 +1155,12 @@ onBeforeUnmount(() => {
   </div>
 
   <!-- Feedback popup -->
-  <div
-    v-if="pendingPick.el && mode === 'feedback'"
-    class="tian-annotate-popup tian-annotate-ignore"
-    :style="{ left: pendingPick.x + 'px', top: pendingPick.y + 'px' }"
-  >
+  <Transition name="tian-fade-scale">
+    <div
+      v-if="pendingPick.el && mode === 'feedback'"
+      class="tian-annotate-popup tian-annotate-ignore"
+      :style="{ left: pendingPick.x + 'px', top: pendingPick.y + 'px' }"
+    >
     <div v-if="pendingPick.isMultiSelect" class="tian-annotate-popup-title">Multi-select ({{ pendingPick.nearbyElements.split(', ').length }} elements)</div>
     <div v-else class="tian-annotate-popup-title">{{ pendingPick.selectedText ? `Selected: "${pendingPick.selectedText.slice(0, 40)}${pendingPick.selectedText.length > 40 ? '…' : ''}"` : describeElement(pendingPick.el) }}</div>
     <textarea
@@ -795,15 +1187,17 @@ onBeforeUnmount(() => {
     <div class="tian-annotate-popup-row">
       <button type="button" class="tian-annotate-btn-ghost" @click="cancelPick">Cancel</button>
       <button type="button" :disabled="!pendingPick.comment.trim()" @click="confirmPick">Add</button>
+      </div>
     </div>
-  </div>
+  </Transition>
 
   <!-- Placement popup -->
-  <div
-    v-if="pendingPick.el && mode === 'placement'"
-    class="tian-annotate-popup tian-annotate-ignore"
-    :style="{ left: pendingPick.x + 'px', top: pendingPick.y + 'px' }"
-  >
+  <Transition name="tian-fade-scale">
+    <div
+      v-if="pendingPick.el && mode === 'placement'"
+      class="tian-annotate-popup tian-annotate-ignore"
+      :style="{ left: pendingPick.x + 'px', top: pendingPick.y + 'px' }"
+    >
     <div class="tian-annotate-popup-title">Place a new component</div>
     <input
       v-model="pendingPick.componentType"
@@ -846,15 +1240,17 @@ onBeforeUnmount(() => {
     <div class="tian-annotate-popup-row">
       <button type="button" class="tian-annotate-btn-ghost" @click="cancelPick">Cancel</button>
       <button type="button" :disabled="!pendingPick.comment.trim() || !pendingPick.componentType.trim()" @click="confirmPick">Add</button>
+      </div>
     </div>
-  </div>
+  </Transition>
 
   <!-- Rearrange popup -->
-  <div
-    v-if="pendingPick.el && mode === 'rearrange' && pendingPick.rearrangeOriginalRect"
-    class="tian-annotate-popup tian-annotate-ignore"
-    :style="{ left: pendingPick.x + 'px', top: pendingPick.y + 'px' }"
-  >
+  <Transition name="tian-fade-scale">
+    <div
+      v-if="pendingPick.el && mode === 'rearrange' && pendingPick.rearrangeOriginalRect"
+      class="tian-annotate-popup tian-annotate-ignore"
+      :style="{ left: pendingPick.x + 'px', top: pendingPick.y + 'px' }"
+    >
     <div class="tian-annotate-popup-title">Move: {{ pendingPick.rearrangeLabel }}</div>
     <div style="font-size:11px;margin-bottom:6px;">
       From {{ pendingPick.rearrangeOriginalRect.x }},{{ pendingPick.rearrangeOriginalRect.y }} → {{ pendingPick.rearrangeCurrentRect?.x }},{{ pendingPick.rearrangeCurrentRect?.y }}
@@ -883,64 +1279,137 @@ onBeforeUnmount(() => {
     <div class="tian-annotate-popup-row">
       <button type="button" class="tian-annotate-btn-ghost" @click="cancelPick">Cancel</button>
       <button type="button" :disabled="!pendingPick.comment.trim()" @click="confirmPick">Add</button>
+      </div>
     </div>
-  </div>
+  </Transition>
 
   <!-- Detail popup (view/edit annotation) -->
   <Teleport to="body">
-    <div
-      v-if="selectedAnnotation"
-      class="tian-annotate-detail-overlay tian-annotate-ignore"
-      @click.self="closeDetail"
-    >
+    <Transition name="tian-overlay">
+      <div
+        v-if="selectedAnnotation"
+        class="tian-annotate-detail-overlay tian-annotate-ignore"
+        @click.self="closeDetail"
+      >
       <div class="tian-annotate-detail tian-annotate-ignore">
         <div class="tian-annotate-detail-header">
-          <span>Annotation {{ annotations.findIndex(a => a.id === selectedAnnotation!.id) + 1 }}</span>
-          <button type="button" class="tian-annotate-btn-ghost" @click="closeDetail">&times;</button>
+          <div class="tian-annotate-detail-header-title">
+            <span class="tian-annotate-detail-index">#{{ annotations.findIndex(a => a.id === selectedAnnotation!.id) + 1 }}</span>
+            <span :class="`tian-annotate-status tian-annotate-status--${selectedAnnotation.status}`">{{ selectedAnnotation.status }}</span>
+          </div>
+          <button type="button" class="tian-annotate-icon-close" aria-label="Close" @click="closeDetail">&times;</button>
         </div>
 
-        <div class="tian-annotate-detail-field">
-          <strong>Element:</strong> {{ selectedAnnotation.element }}
+        <div class="tian-annotate-detail-body">
+          <div class="tian-annotate-field">
+            <span class="tian-annotate-field-label">Element</span>
+            <span class="tian-annotate-field-value tian-annotate-mono">{{ selectedAnnotation.element }}</span>
+          </div>
+
+          <div class="tian-annotate-field">
+            <div class="tian-annotate-field-label-row">
+              <span class="tian-annotate-field-label">Comment</span>
+              <button v-if="!editingComment" type="button" class="tian-annotate-link-btn" :disabled="selectedAnnotation.status === 'resolved' || !!dispatching" @click="startEditComment">Edit</button>
+            </div>
+            <p v-if="!editingComment" class="tian-annotate-field-value">{{ selectedAnnotation.comment }}</p>
+            <template v-else>
+              <textarea v-model="editCommentText" class="tian-annotate-textarea" rows="3" :disabled="!!dispatching" />
+              <div class="tian-annotate-detail-field-actions">
+                <button type="button" class="tian-annotate-btn-ghost-sm" @click="cancelEditComment">Cancel</button>
+                <button type="button" class="tian-annotate-btn-sm" :disabled="!editCommentText.trim()" @click="saveEditComment">Save</button>
+              </div>
+            </template>
+          </div>
+
+          <div v-if="selectedAnnotation.selectedText" class="tian-annotate-field">
+            <span class="tian-annotate-field-label">Selected text</span>
+            <p class="tian-annotate-field-value tian-annotate-field-value--quote">"{{ selectedAnnotation.selectedText }}"</p>
+          </div>
+
+          <div v-if="selectedAnnotation.intent || selectedAnnotation.severity" class="tian-annotate-field-row">
+            <div v-if="selectedAnnotation.intent" class="tian-annotate-field">
+              <span class="tian-annotate-field-label">Intent</span>
+              <span class="tian-annotate-field-value">{{ selectedAnnotation.intent }}</span>
+            </div>
+            <div v-if="selectedAnnotation.severity" class="tian-annotate-field">
+              <span class="tian-annotate-field-label">Severity</span>
+              <span class="tian-annotate-field-value">{{ selectedAnnotation.severity }}</span>
+            </div>
+          </div>
         </div>
-        <div class="tian-annotate-detail-field">
-          <strong>Status:</strong>
-          <span :class="`tian-annotate-status tian-annotate-status--${selectedAnnotation.status}`">{{ selectedAnnotation.status }}</span>
-        </div>
-        <div class="tian-annotate-detail-field">
-          <strong>Comment:</strong> {{ selectedAnnotation.comment }}
-        </div>
-        <div v-if="selectedAnnotation.selectedText" class="tian-annotate-detail-field">
-          <strong>Selected text:</strong> "{{ selectedAnnotation.selectedText }}"
-        </div>
-        <div v-if="selectedAnnotation.intent" class="tian-annotate-detail-field">
-          <strong>Intent:</strong> {{ selectedAnnotation.intent }}
-        </div>
-        <div v-if="selectedAnnotation.severity" class="tian-annotate-detail-field">
-          <strong>Severity:</strong> {{ selectedAnnotation.severity }}
+
+        <!-- Agent sync + dispatch -->
+        <div v-if="syncEnabled" class="tian-annotate-agent-block">
+          <div class="tian-annotate-agent-sync">
+            <span class="tian-annotate-agent-sync-dot"></span>
+            <span class="tian-annotate-agent-sync-text">
+              Synced to {{ syncEndpointHost }}<template v-if="selectedAnnotation.updatedAt"> · {{ formatRelativeTime(selectedAnnotation.updatedAt) }}</template>
+            </span>
+            <button type="button" class="tian-annotate-link-btn" @click="syncNow">Sync now</button>
+          </div>
+          <div class="tian-annotate-dispatch-row">
+            <button
+              type="button"
+              class="tian-annotate-btn-dispatch tian-annotate-btn-dispatch--icon"
+              :class="{ 'is-loading': dispatching === 'claude' }"
+              :disabled="!!dispatching || selectedAnnotation.status === 'resolved'"
+              :aria-label="dispatching === 'claude' ? 'Starting Claude…' : 'Fix with Claude'"
+              :title="dispatching === 'claude' ? 'Starting Claude…' : 'Fix with Claude'"
+              @click="runAgent('claude')"
+            >
+              <span v-if="dispatching === 'claude'" class="tian-annotate-spinner"></span>
+              <span v-else class="tian-annotate-dispatch-icon" v-html="claudeLogo"></span>
+            </button>
+            <button
+              type="button"
+              class="tian-annotate-btn-dispatch tian-annotate-btn-dispatch--icon"
+              :class="{ 'is-loading': dispatching === 'opencode' }"
+              :disabled="!!dispatching || selectedAnnotation.status === 'resolved'"
+              :aria-label="dispatching === 'opencode' ? 'Starting OpenCode…' : 'Fix with OpenCode'"
+              :title="dispatching === 'opencode' ? 'Starting OpenCode…' : 'Fix with OpenCode'"
+              @click="runAgent('opencode')"
+            >
+              <span v-if="dispatching === 'opencode'" class="tian-annotate-spinner"></span>
+              <span v-else class="tian-annotate-dispatch-icon" v-html="opencodeLogo"></span>
+            </button>
+          </div>
+          <p v-if="dispatchError" class="tian-annotate-dispatch-error">{{ dispatchError }}</p>
         </div>
 
         <!-- Thread -->
         <div class="tian-annotate-detail-section">
-          <strong>Thread</strong>
-          <div v-if="selectedAnnotation.thread?.length" class="tian-annotate-thread-messages">
-            <div
-              v-for="msg in selectedAnnotation.thread"
-              :key="msg.id"
-              class="tian-annotate-thread-msg"
-              :class="`tian-annotate-thread-msg--${msg.role}`"
-            >
-              <span class="tian-annotate-thread-role">{{ msg.role }}</span>
-              <span class="tian-annotate-thread-content">{{ msg.content }}</span>
+          <span class="tian-annotate-field-label">Thread</span>
+          <Transition name="tian-thread-appear">
+            <div v-if="selectedAnnotation.thread?.length" class="tian-annotate-thread-messages">
+              <div
+                v-for="msg in selectedAnnotation.thread"
+                :key="msg.id"
+                class="tian-annotate-thread-msg"
+                :class="[`tian-annotate-thread-msg--${msg.role}`, { 'tian-annotate-thread-msg--log': msg.content.includes('\n') }]"
+              >
+                <span class="tian-annotate-thread-role" :class="`tian-annotate-thread-role--${msg.role}`">{{ msg.role }}</span>
+                <span class="tian-annotate-thread-content">{{ msg.content }}</span>
+              </div>
+              <div v-if="agentRunStatus" class="tian-annotate-thread-running">
+                <span class="tian-annotate-spinner"></span>
+                <span>{{ agentRunStatus.agent }} is running…</span>
+              </div>
             </div>
-          </div>
-          <div class="tian-annotate-thread-input-row">
+            <div v-else-if="agentRunStatus" class="tian-annotate-thread-messages">
+              <div class="tian-annotate-thread-running">
+                <span class="tian-annotate-spinner"></span>
+                <span>{{ agentRunStatus.agent }} is running…</span>
+              </div>
+            </div>
+          </Transition>
+          <div v-if="selectedAnnotation.status !== 'resolved'" class="tian-annotate-thread-input-row">
             <select v-model="threadRole" class="tian-annotate-thread-role-select">
               <option value="human">Human</option>
               <option value="agent">Agent</option>
             </select>
             <input
               v-model="threadMessage"
-              class="tian-annotate-input"
+              class="tian-annotate-input tian-annotate-input--inline"
               placeholder="Add message..."
               @keydown.enter="submitThreadMessage"
             />
@@ -950,22 +1419,25 @@ onBeforeUnmount(() => {
 
         <!-- Actions -->
         <div class="tian-annotate-detail-actions">
-          <button
-            v-if="selectedAnnotation.status !== 'acknowledged' && selectedAnnotation.status !== 'resolved' && selectedAnnotation.status !== 'dismissed'"
-            type="button"
-            class="tian-annotate-btn-status tian-annotate-btn--acknowledge"
-            @click="markStatus(selectedAnnotation.id, 'acknowledged')"
-          >Mark acknowledged</button>
-          <button
-            v-if="selectedAnnotation.status !== 'resolved'"
-            type="button"
-            class="tian-annotate-btn-status tian-annotate-btn--resolve"
-            @click="markStatus(selectedAnnotation.id, 'resolved')"
-          >Mark resolved</button>
-          <button type="button" class="tian-annotate-btn-status tian-annotate-btn--delete" @click="deleteAnnotation(selectedAnnotation.id)">Delete</button>
+          <button type="button" class="tian-annotate-btn-danger-ghost" @click="deleteAnnotation(selectedAnnotation.id)">Delete</button>
+          <div class="tian-annotate-detail-actions-main">
+            <button
+              v-if="selectedAnnotation.status !== 'acknowledged' && selectedAnnotation.status !== 'resolved' && selectedAnnotation.status !== 'dismissed'"
+              type="button"
+              class="tian-annotate-btn-outline tian-annotate-btn-outline--amber"
+              @click="markStatus(selectedAnnotation.id, 'acknowledged')"
+            >Acknowledge</button>
+            <button
+              v-if="selectedAnnotation.status !== 'resolved'"
+              type="button"
+              class="tian-annotate-btn-primary"
+              @click="markStatus(selectedAnnotation.id, 'resolved')"
+            >Mark resolved</button>
+          </div>
+          </div>
         </div>
       </div>
-    </div>
+    </Transition>
   </Teleport>
 
   <!-- Pins -->
@@ -974,7 +1446,7 @@ onBeforeUnmount(() => {
       <div
         v-for="(a, i) in filteredAnnotations"
         :key="a.id"
-        :class="pinClass(a)"
+        :class="[pinClass(a), 'tian-annotate-ignore']"
         :style="pinStyle(a)"
         :title="`#${i + 1}: ${a.comment}`"
         @click.stop="selectAnnotation(a)"
@@ -993,6 +1465,19 @@ onBeforeUnmount(() => {
   outline-offset: 1px !important;
   cursor: crosshair !important;
   transition: outline-color 80ms ease-out;
+}
+
+.tian-annotate-multiselect-item-outline {
+  outline: 2px dashed #6366f1 !important;
+  outline-offset: 1px !important;
+  pointer-events: none;
+}
+
+/* Applied while a Shift+drag marquee select is in progress, so the browser's
+   native text-selection doesn't race our own drag-rect highlight. */
+html.tian-annotate-no-select,
+html.tian-annotate-no-select * {
+  user-select: none !important;
 }
 
 .tian-annotate-tag-hint {
@@ -1019,10 +1504,22 @@ onBeforeUnmount(() => {
   border: none;
   background: #18181b;
   color: #fff;
-  font-size: 22px;
   line-height: 1;
   cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
   box-shadow: 0 4px 14px rgba(0, 0, 0, 0.25);
+}
+.tian-annotate-toggle-icon {
+  display: inline-flex;
+  width: 22px;
+  height: 22px;
+}
+.tian-annotate-toggle-icon svg {
+  width: 100%;
+  height: 100%;
+  fill: currentColor;
 }
 
 .tian-annotate-icon-bar {
@@ -1055,6 +1552,9 @@ onBeforeUnmount(() => {
   background: #6366f1;
   color: #fff;
 }
+.tian-annotate-icon-btn.is-success {
+  color: #22c55e;
+}
 .tian-annotate-icon-btn:disabled {
   opacity: 0.35;
   cursor: not-allowed;
@@ -1067,40 +1567,122 @@ onBeforeUnmount(() => {
 }
 
 .tian-annotate-panel {
-  background: #fff;
-  border: 1px solid #e4e4e7;
-  border-radius: 10px;
-  padding: 10px 12px;
-  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.12);
+  background: rgba(20, 20, 23, 0.96);
+  backdrop-filter: blur(10px);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 14px;
+  padding: 12px;
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.32);
   font-size: 13px;
-  color: #18181b;
-  min-width: 240px;
+  color: #fafafa;
+  width: 260px;
 }
-@media (prefers-color-scheme: dark) {
-  .tian-annotate-panel {
-    background: #18181b;
-    color: #fafafa;
-    border-color: #3f3f46;
-  }
-}
-.tian-annotate-panel-row {
+.tian-annotate-panel-header {
   display: flex;
+  align-items: baseline;
   justify-content: space-between;
-  align-items: center;
   gap: 8px;
-  margin-bottom: 6px;
+  padding-bottom: 10px;
+  margin-bottom: 10px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.08);
 }
-.tian-annotate-panel-row:last-child {
+.tian-annotate-panel-title {
+  font-size: 13px;
+  font-weight: 700;
+  letter-spacing: 0.01em;
+}
+.tian-annotate-panel-count {
+  font-size: 11px;
+  color: #a1a1aa;
+}
+.tian-annotate-panel-section {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  margin-bottom: 10px;
+}
+.tian-annotate-panel-section:last-child {
   margin-bottom: 0;
 }
-.tian-annotate-panel button,
-.tian-annotate-panel select {
+.tian-annotate-panel-section-title {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  color: #a1a1aa;
+  margin-bottom: 8px;
+}
+.tian-annotate-panel-refresh {
+  border: none;
+  background: transparent;
+  color: #a1a1aa;
   font-size: 12px;
-  padding: 4px 8px;
-  border-radius: 6px;
-  border: 1px solid #d4d4d8;
-  background: #fff;
+  line-height: 1;
+  padding: 0 2px;
   cursor: pointer;
+}
+.tian-annotate-panel-refresh:hover:not(:disabled) {
+  color: #fafafa;
+}
+.tian-annotate-panel-refresh:disabled {
+  cursor: not-allowed;
+  opacity: 0.6;
+}
+.tian-annotate-panel-hint {
+  font-size: 10.5px;
+  color: #71717a;
+  line-height: 1.4;
+}
+.tian-annotate-panel-divider {
+  height: 1px;
+  background: rgba(255, 255, 255, 0.08);
+  margin: 10px 0;
+}
+.tian-annotate-panel-label {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 11px;
+  font-weight: 600;
+  color: #d4d4d8;
+}
+.tian-annotate-panel-label-icon {
+  display: inline-flex;
+  width: 13px;
+  height: 13px;
+  flex-shrink: 0;
+}
+.tian-annotate-panel-label-icon svg {
+  width: 100%;
+  height: 100%;
+}
+.tian-annotate-panel-select {
+  width: 100%;
+  font-size: 12px;
+  padding: 6px 8px;
+  border-radius: 7px;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  background: rgba(255, 255, 255, 0.06);
+  color: #fafafa;
+  cursor: pointer;
+  font-family: inherit;
+}
+.tian-annotate-panel-select:focus {
+  outline: none;
+  border-color: #6366f1;
+  background: rgba(255, 255, 255, 0.09);
+}
+.tian-annotate-panel-input {
+  cursor: text;
+}
+.tian-annotate-panel-input::placeholder {
+  color: #71717a;
+}
+.tian-annotate-panel select option {
+  color: #18181b;
 }
 .tian-annotate-btn-ghost {
   background: transparent !important;
@@ -1236,7 +1818,7 @@ onBeforeUnmount(() => {
 .tian-annotate-multiselect-overlay {
   position: fixed;
   z-index: 999997;
-  border: 2px solid #6366f1;
+  border: 2px dashed #6366f1;
   border-radius: 6px;
   background: rgba(99, 102, 241, 0.12);
   pointer-events: none;
@@ -1270,13 +1852,12 @@ onBeforeUnmount(() => {
 .tian-annotate-detail {
   background: #fff;
   border: 1px solid #e4e4e7;
-  border-radius: 12px;
-  padding: 16px;
-  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.2);
+  border-radius: 14px;
+  box-shadow: 0 16px 48px rgba(0, 0, 0, 0.16);
   font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
   font-size: 13px;
   color: #18181b;
-  width: 400px;
+  width: 380px;
   max-height: 80vh;
   overflow-y: auto;
 }
@@ -1284,60 +1865,296 @@ onBeforeUnmount(() => {
   display: flex;
   justify-content: space-between;
   align-items: center;
-  font-weight: 600;
-  margin-bottom: 12px;
+  padding: 14px 12px 14px 16px;
+  border-bottom: 1px solid #e4e4e7;
+  position: sticky;
+  top: 0;
+  background: inherit;
 }
-.tian-annotate-detail-field {
-  margin-bottom: 8px;
+.tian-annotate-detail-header-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.tian-annotate-detail-index {
+  font-weight: 600;
+  font-size: 13px;
+  color: #3f3f46;
+}
+.tian-annotate-icon-close {
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  border: none;
+  background: transparent;
+  color: #71717a;
+  font-size: 16px;
+  line-height: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+}
+.tian-annotate-icon-close:hover {
+  background: #f4f4f5;
+  color: #18181b;
+}
+
+.tian-annotate-detail-body {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  padding: 16px;
+}
+.tian-annotate-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+.tian-annotate-field-row {
+  display: flex;
+  gap: 20px;
+}
+.tian-annotate-field-row .tian-annotate-field {
+  flex: 1;
+}
+.tian-annotate-field-label-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+.tian-annotate-field-label {
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: #a1a1aa;
+}
+.tian-annotate-field-value {
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.5;
+  color: #18181b;
   word-break: break-word;
+  text-transform: capitalize;
+}
+.tian-annotate-field-value--quote {
+  font-style: italic;
+  color: #52525b;
+  text-transform: none;
+}
+.tian-annotate-mono {
+  font-family: ui-monospace, monospace;
+  font-size: 12px;
+  text-transform: none;
+}
+
+.tian-annotate-link-btn {
+  background: none;
+  border: none;
+  padding: 0;
+  color: #6366f1;
+  font-size: 11.5px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.tian-annotate-link-btn:hover {
+  text-decoration: underline;
+}
+
+.tian-annotate-detail-field-actions {
+  display: flex;
+  gap: 6px;
+  justify-content: flex-end;
+  margin-top: 4px;
+}
+.tian-annotate-textarea {
+  width: 100%;
+  font-size: 12.5px;
+  font-family: inherit;
+  padding: 8px;
+  border-radius: 8px;
+  border: 1px solid #d4d4d8;
+  background: transparent;
+  color: inherit;
+  resize: vertical;
+}
+.tian-annotate-textarea:focus {
+  outline: none;
+  border-color: #6366f1;
+}
+.tian-annotate-btn-ghost-sm {
+  font-size: 11px;
+  padding: 4px 8px;
+  border-radius: 6px;
+  border: 1px solid #d4d4d8;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
 }
 .tian-annotate-detail-section {
-  margin-top: 12px;
-  padding-top: 12px;
+  padding: 12px 16px;
   border-top: 1px solid #e4e4e7;
 }
 .tian-annotate-detail-actions {
-  margin-top: 12px;
-  padding-top: 12px;
+  padding: 12px 16px;
   border-top: 1px solid #e4e4e7;
   display: flex;
-  gap: 6px;
-  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.tian-annotate-detail-actions-main {
+  display: flex;
+  gap: 8px;
 }
 
 .tian-annotate-status {
-  font-size: 11px;
-  padding: 2px 6px;
-  border-radius: 4px;
+  font-size: 10.5px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.02em;
+  padding: 3px 9px;
+  border-radius: 999px;
 }
-.tian-annotate-status--pending { background: #6366f1; color: #fff; }
-.tian-annotate-status--acknowledged { background: #f59e0b; color: #fff; }
-.tian-annotate-status--resolved { background: #6b7280; color: #fff; }
+.tian-annotate-status--pending { background: #e0e7ff; color: #4338ca; }
+.tian-annotate-status--acknowledged { background: #fef3c7; color: #b45309; }
+.tian-annotate-status--resolved { background: #dcfce7; color: #15803d; }
+.tian-annotate-status--dismissed { background: #f4f4f5; color: #71717a; }
+
+.tian-annotate-agent-block {
+  padding: 10px 16px;
+  background: #fafafa;
+  border-top: 1px solid #e4e4e7;
+  border-bottom: 1px solid #e4e4e7;
+}
+.tian-annotate-agent-sync {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  flex-wrap: wrap;
+  font-size: 11.5px;
+  color: #52525b;
+}
+.tian-annotate-dispatch-row {
+  display: flex;
+  gap: 6px;
+  margin-top: 8px;
+}
+.tian-annotate-btn-dispatch {
+  flex: 1;
+  font-size: 11.5px;
+  font-weight: 600;
+  padding: 6px 8px;
+  border-radius: 7px;
+  border: 1px solid #d4d4d8;
+  background: #fff;
+  color: #18181b;
+  cursor: pointer;
+}
+.tian-annotate-btn-dispatch:hover:not(:disabled) {
+  border-color: #6366f1;
+  color: #4f46e5;
+}
+.tian-annotate-btn-dispatch:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+.tian-annotate-btn-dispatch--icon {
+  flex: none;
+  width: 32px;
+  height: 32px;
+  padding: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.tian-annotate-btn-dispatch--icon .tian-annotate-spinner {
+  margin-right: 0;
+}
+.tian-annotate-dispatch-icon {
+  display: inline-flex;
+  width: 16px;
+  height: 16px;
+}
+.tian-annotate-dispatch-icon svg {
+  width: 100%;
+  height: 100%;
+}
+.tian-annotate-dispatch-error {
+  margin: 6px 0 0;
+  font-size: 11px;
+  color: #b91c1c;
+}
+.tian-annotate-agent-sync-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #22c55e;
+  box-shadow: 0 0 0 3px rgba(34, 197, 94, 0.15);
+  flex-shrink: 0;
+}
+.tian-annotate-agent-sync-text {
+  flex: 1;
+  min-width: 0;
+}
 
 .tian-annotate-thread-messages {
   max-height: 160px;
   overflow-y: auto;
-  margin: 6px 0;
+  margin-top: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
 }
 .tian-annotate-thread-msg {
-  padding: 4px 8px;
-  border-radius: 6px;
-  margin-bottom: 4px;
+  padding: 6px 10px;
+  border-radius: 8px;
   font-size: 12px;
+  line-height: 1.45;
 }
-.tian-annotate-thread-msg--human { background: #f0f0ff; }
-.tian-annotate-thread-msg--agent { background: #f0fff0; }
+.tian-annotate-thread-msg--human { background: #f4f4f9; }
+.tian-annotate-thread-msg--agent { background: #f2faf5; }
 .tian-annotate-thread-role {
-  font-weight: 600;
+  display: inline-block;
+  font-weight: 700;
   text-transform: uppercase;
-  font-size: 10px;
-  margin-right: 4px;
+  font-size: 9px;
+  letter-spacing: 0.03em;
+  padding: 1px 6px;
+  border-radius: 999px;
+  margin-right: 6px;
+  vertical-align: middle;
 }
-.tian-annotate-thread-content { word-break: break-word; }
+.tian-annotate-thread-role--human { background: #e0e7ff; color: #4338ca; }
+.tian-annotate-thread-role--agent { background: #dcfce7; color: #15803d; }
+.tian-annotate-thread-content { word-break: break-word; color: #27272a; white-space: pre-wrap; }
+.tian-annotate-thread-msg--log .tian-annotate-thread-content {
+  display: block;
+  margin-top: 4px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 11px;
+  line-height: 1.5;
+}
+.tian-annotate-thread-running {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 10px;
+  border-radius: 8px;
+  font-size: 12px;
+  color: #4338ca;
+  background: #eef2ff;
+}
+.tian-annotate-thread-running .tian-annotate-spinner {
+  border-color: rgba(67, 56, 202, 0.25);
+  border-top-color: #4338ca;
+}
 .tian-annotate-thread-input-row {
   display: flex;
-  gap: 4px;
-  margin-top: 6px;
+  gap: 6px;
+  margin-top: 8px;
 }
 .tian-annotate-thread-role-select {
   font-size: 11px;
@@ -1346,26 +2163,193 @@ onBeforeUnmount(() => {
   background: transparent;
   color: inherit;
   padding: 2px 4px;
+  flex-shrink: 0;
+}
+.tian-annotate-input--inline {
+  width: auto;
+  flex: 1;
+  min-width: 0;
+  margin-bottom: 0;
 }
 .tian-annotate-btn-sm {
   font-size: 11px;
-  padding: 4px 8px;
+  padding: 4px 10px;
   border-radius: 6px;
-  border: 1px solid #d4d4d8;
+  border: none;
+  background: #6366f1;
+  color: #fff;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+.tian-annotate-btn-sm:hover:not(:disabled) { background: #4f46e5; }
+.tian-annotate-btn-sm:disabled { opacity: 0.5; cursor: not-allowed; }
+
+.tian-annotate-btn-primary {
+  font-size: 12.5px;
+  font-weight: 600;
+  padding: 7px 14px;
+  border-radius: 8px;
+  border: none;
   background: #6366f1;
   color: #fff;
   cursor: pointer;
 }
-.tian-annotate-btn-sm:disabled { opacity: 0.5; cursor: not-allowed; }
+.tian-annotate-btn-primary:hover { background: #4f46e5; }
 
-.tian-annotate-btn-status {
-  font-size: 12px;
-  padding: 6px 10px;
-  border-radius: 6px;
-  border: 1px solid #d4d4d8;
+.tian-annotate-btn-outline {
+  font-size: 12.5px;
+  font-weight: 600;
+  padding: 7px 14px;
+  border-radius: 8px;
+  background: transparent;
   cursor: pointer;
 }
-.tian-annotate-btn--acknowledge { background: #f59e0b; color: #fff; border-color: #f59e0b; }
-.tian-annotate-btn--resolve { background: #10b981; color: #fff; border-color: #10b981; }
-.tian-annotate-btn--delete { background: #ef4444; color: #fff; border-color: #ef4444; }
+.tian-annotate-btn-outline--amber {
+  border: 1px solid #fbbf24;
+  color: #b45309;
+}
+.tian-annotate-btn-outline--amber:hover { background: #fffbeb; }
+
+.tian-annotate-btn-danger-ghost {
+  font-size: 12.5px;
+  font-weight: 600;
+  padding: 7px 10px;
+  border-radius: 8px;
+  border: none;
+  background: transparent;
+  color: #ef4444;
+  cursor: pointer;
+}
+.tian-annotate-btn-danger-ghost:hover { background: #fef2f2; }
+
+/* ---- Transitions ---- */
+
+/* Icon swap inside toolbar buttons (e.g. copy/trash -> check on success) */
+.tian-icon-pop-enter-active,
+.tian-icon-pop-leave-active {
+  transition: opacity 110ms ease-out, transform 110ms ease-out;
+}
+.tian-icon-pop-enter-from {
+  opacity: 0;
+  transform: scale(0.5);
+}
+.tian-icon-pop-leave-to {
+  opacity: 0;
+  transform: scale(0.5);
+}
+
+/* Tooltip hover tag */
+.tian-tag-enter-active,
+.tian-tag-leave-active {
+  transition: opacity 100ms ease-out, transform 100ms ease-out;
+}
+.tian-tag-enter-from,
+.tian-tag-leave-to {
+  opacity: 0;
+  transform: translateY(2px) scale(0.97);
+}
+
+/* Toolbar: "+" toggle <-> pill icon bar */
+.tian-toolbar-enter-active,
+.tian-toolbar-leave-active {
+  transition: opacity 130ms ease-out, transform 130ms ease-out;
+}
+.tian-toolbar-enter-from,
+.tian-toolbar-leave-to {
+  opacity: 0;
+  transform: scale(0.85);
+}
+
+/* Settings panel */
+.tian-panel-enter-active,
+.tian-panel-leave-active {
+  transition: opacity 120ms ease-out, transform 120ms ease-out;
+  transform-origin: top;
+}
+.tian-panel-enter-from,
+.tian-panel-leave-to {
+  opacity: 0;
+  transform: translateY(-4px) scaleY(0.96);
+}
+
+/* Thread messages / running indicator appearing in the detail modal */
+.tian-thread-appear-enter-active,
+.tian-thread-appear-leave-active {
+  transition: opacity 140ms ease-out, transform 140ms ease-out;
+  transform-origin: top;
+}
+.tian-thread-appear-enter-from,
+.tian-thread-appear-leave-to {
+  opacity: 0;
+  transform: translateY(-4px) scaleY(0.97);
+}
+
+/* Shared fade+scale for popups */
+.tian-fade-scale-enter-active,
+.tian-fade-scale-leave-active {
+  transition: opacity 130ms ease-out, transform 130ms ease-out;
+}
+.tian-fade-scale-enter-from,
+.tian-fade-scale-leave-to {
+  opacity: 0;
+  transform: scale(0.96);
+}
+
+/* Overlay backdrop (detail modal) */
+.tian-overlay-enter-active {
+  transition: opacity 100ms ease-out;
+}
+.tian-overlay-leave-active {
+  transition: opacity 80ms ease-out;
+}
+.tian-overlay-enter-from,
+.tian-overlay-leave-to {
+  opacity: 0;
+}
+.tian-overlay-enter-active .tian-annotate-detail {
+  transition: opacity 130ms ease-out 30ms, transform 130ms ease-out 30ms;
+}
+.tian-overlay-leave-active .tian-annotate-detail {
+  transition: opacity 100ms ease-out, transform 100ms ease-out;
+}
+.tian-overlay-enter-from .tian-annotate-detail,
+.tian-overlay-leave-to .tian-annotate-detail {
+  opacity: 0;
+  transform: scale(0.96);
+}
+
+/* ---- Spinner ---- */
+@keyframes tian-spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+.tian-annotate-spinner {
+  display: inline-block;
+  width: 11px;
+  height: 11px;
+  border: 2px solid rgba(0, 0, 0, 0.15);
+  border-top-color: #18181b;
+  border-radius: 50%;
+  animation: tian-spin 0.6s linear infinite;
+  margin-right: 4px;
+  vertical-align: -2px;
+}
+
+/* Loading state for dispatch buttons */
+.tian-annotate-btn-dispatch.is-loading {
+  border-color: #6366f1;
+  background: #eef2ff;
+  color: #4f46e5;
+}
+.tian-annotate-btn-dispatch.is-loading .tian-annotate-spinner {
+  border-color: rgba(79, 70, 229, 0.2);
+  border-top-color: #4f46e5;
+}
+
+/* Disabled link button */
+.tian-annotate-link-btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+  text-decoration: none !important;
+}
 </style>
