@@ -1,0 +1,44 @@
+{
+  "name": "tian-annotate-vue",
+  "version": "0.1.0",
+  "description": "Click-to-annotate visual feedback toolbar for Vue 3 apps, for pasting structured feedback into AI coding agents.",
+  "type": "module",
+  "main": "./dist/tian-annotate-vue.umd.cjs",
+  "module": "./dist/tian-annotate-vue.es.js",
+  "types": "./dist/index.d.ts",
+  "files": [
+    "dist"
+  ],
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/tian-annotate-vue.es.js",
+      "require": "./dist/tian-annotate-vue.umd.cjs"
+    },
+    "./style.css": "./dist/style.css"
+  },
+  "peerDependencies": {
+    "vue": "^3.3"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-vue": "^5.0.0",
+    "playwright": "^1.61.1",
+    "typescript": "^5.4.0",
+    "vite": "^5.0.0",
+    "vite-plugin-dts": "^3.0.0",
+    "vue-tsc": "^2.0.0"
+  },
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "typecheck": "vue-tsc --noEmit"
+  },
+  "license": "MIT",
+  "keywords": [
+    "vue",
+    "vue3",
+    "annotation",
+    "ai-agents",
+    "developer-tools"
+  ]
+}
