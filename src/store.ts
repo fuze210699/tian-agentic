@@ -1,6 +1,6 @@
 import { reactive, computed, watch } from 'vue';
-import type { Annotation, ThreadMessage } from './types';
-import { syncCreate, syncUpdate, syncThreadMessage, syncDelete, fetchAnnotations } from './sync';
+import type { Annotation } from './types';
+import { syncCreate, syncUpdate, syncDelete, fetchAnnotations } from './sync';
 
 const annotations = reactive<Annotation[]>([]);
 
@@ -66,14 +66,18 @@ function loadFromStorage() {
         annotations.splice(0, annotations.length, ...data);
       }
     }
-  } catch { /* ignore corrupt data */ }
+  } catch {
+    /* ignore corrupt data */
+  }
 }
 
 function saveToStorage() {
   if (!persistKey) return;
   try {
     localStorage.setItem(persistKey, JSON.stringify(annotations));
-  } catch { /* ignore quota errors */ }
+  } catch {
+    /* ignore quota errors */
+  }
 }
 
 let saveWatcher: ReturnType<typeof watch> | null = null;
@@ -141,18 +145,6 @@ export function useTianAnnotateStore(
     annotations.splice(0, annotations.length);
   }
 
-  function addThreadMessage(id: string, message: Omit<ThreadMessage, 'id' | 'timestamp'>) {
-    const found = annotations.find((a) => a.id === id);
-    if (!found) return;
-    if (!found.thread) found.thread = [];
-    found.thread.push({
-      id: nextId(),
-      timestamp: Date.now(),
-      ...message,
-    });
-    if (syncEndpoint) syncThreadMessage(syncEndpoint, id, message);
-  }
-
   function startSync(intervalMs = 3000) {
     if (!syncEndpoint || syncPollHandle) return;
     syncPollHandle = setInterval(pollSync, intervalMs);
@@ -181,7 +173,6 @@ export function useTianAnnotateStore(
     setStatus,
     removeAnnotation,
     clearAll,
-    addThreadMessage,
     startSync,
     stopSync,
     syncNow,

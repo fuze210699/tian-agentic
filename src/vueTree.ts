@@ -26,12 +26,18 @@ const BUILTIN_NAMES = new Set([
   'BaseTransition',
 ]);
 
-/** Find the nearest Vue component instance that owns `el`, walking up the DOM. */
+/** Find the nearest Vue component instance that owns `el`, walking up the DOM
+ * through shadow boundaries. */
 export function getVueInstance(el: Element | null): VueInstanceLike | null {
   let node = el as VueAttachedElement | null;
   while (node) {
     if (node.__vueParentComponent) return node.__vueParentComponent;
-    node = node.parentElement as VueAttachedElement | null;
+    let next: Element | null = node.parentElement;
+    if (!next) {
+      const root = node.getRootNode();
+      next = (root instanceof ShadowRoot ? root.host : null) as Element | null;
+    }
+    node = next as VueAttachedElement | null;
   }
   return null;
 }

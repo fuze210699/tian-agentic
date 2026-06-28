@@ -1,0 +1,9 @@
+dist
+node_modules
+docs/archive
+
+# Prettier's markdown printer isn't idempotent on this file: wrapped
+# inline-code spans inside list continuation lines get re-indented by a
+# couple spaces on every run (cosmetic only, doesn't affect rendering) —
+# excluded so `format:check` doesn't flap between runs.
+PLAN-agentation-parity.md

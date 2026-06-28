@@ -1,5 +1,36 @@
 import type { Rect } from './types';
 
+/** Walk up from `el` through shadow boundaries — when `parentElement` is
+ * null but the node lives inside a shadow root, step out to the host. */
+export function composedAncestors(el: Element): Element[] {
+  const ancestors: Element[] = [];
+  let node: Element | null = el;
+  while (node) {
+    ancestors.push(node);
+    if (node.parentElement) {
+      node = node.parentElement;
+    } else {
+      const root = node.getRootNode();
+      node = (root instanceof ShadowRoot ? root.host : null) as Element | null;
+    }
+  }
+  return ancestors;
+}
+
+/** Recursively collect all elements including those inside open shadow roots. */
+export function collectAllElements(): Element[] {
+  const results: Element[] = [];
+  function walk(root: Document | ShadowRoot) {
+    const els = Array.from(root.querySelectorAll('*'));
+    for (const el of els) {
+      results.push(el);
+      if (el.shadowRoot) walk(el.shadowRoot);
+    }
+  }
+  walk(document);
+  return results;
+}
+
 export function getElementPath(el: Element, maxDepth = 6): string {
   const parts: string[] = [];
   let node: Element | null = el;
@@ -7,7 +38,9 @@ export function getElementPath(el: Element, maxDepth = 6): string {
   while (node && node.nodeType === 1 && depth < maxDepth) {
     parts.unshift(describeElement(node));
     if (node.tagName.toLowerCase() === 'body') break;
-    node = node.parentElement;
+    node =
+      node.parentElement ||
+      (node.getRootNode() instanceof ShadowRoot ? (node.getRootNode() as ShadowRoot).host : null);
     depth++;
   }
   return parts.join(' > ');
@@ -18,7 +51,11 @@ export function getFullPath(el: Element): string {
   let node: Element | null = el;
   while (node && node.nodeType === 1) {
     const tag = node.tagName.toLowerCase();
-    const parent: Element | null = node.parentElement;
+    let parent: Element | null = node.parentElement;
+    if (!parent) {
+      const root = node.getRootNode();
+      parent = (root instanceof ShadowRoot ? root.host : null) as Element | null;
+    }
     if (!parent) {
       parts.unshift(tag);
       break;
@@ -32,13 +69,26 @@ export function getFullPath(el: Element): string {
   return parts.join(' > ');
 }
 
+const INTERACTIVE_TAGS_SET = new Set(['button', 'a']);
+
 export function describeElement(el: Element): string {
   const tag = el.tagName.toLowerCase();
+  if (
+    INTERACTIVE_TAGS_SET.has(tag) ||
+    el.getAttribute('role') === 'button' ||
+    el.getAttribute('role') === 'link'
+  ) {
+    const text = (el.textContent || '').trim().replace(/\s+/g, ' ').slice(0, 40);
+    if (text) return `"${text}" ${tag}`;
+  }
   const cls = firstMeaningfulClass(el);
   return cls ? `${tag}.${cls}` : tag;
 }
 
-const INTERNAL_CLASSES = new Set(['tian-annotate-hover-outline', 'tian-annotate-multiselect-item-outline']);
+const INTERNAL_CLASSES = new Set([
+  'tian-annotate-hover-outline',
+  'tian-annotate-multiselect-item-outline',
+]);
 
 function firstMeaningfulClass(el: Element): string | null {
   const classes = Array.from(el.classList).filter(
@@ -120,7 +170,9 @@ const STYLE_KEYS = [
 
 export function getComputedStylesSummary(el: Element): string {
   const computed = window.getComputedStyle(el);
-  return STYLE_KEYS.map((key) => `${key}: ${computed[key as keyof CSSStyleDeclaration]}`).join('; ');
+  return STYLE_KEYS.map((key) => `${key}: ${computed[key as keyof CSSStyleDeclaration]}`).join(
+    '; '
+  );
 }
 
 export function getNearbyText(el: Element, max = 140): string {
@@ -148,16 +200,11 @@ export function getAccessibilitySummary(el: Element): string | undefined {
  * drag area. */
 const MIN_CONTAINMENT_RATIO = 0.6;
 
-export function getElementsInRect(rect: { left: number; top: number; width: number; height: number }, maxResults = 10): Element[] {
-  return getElementsInRectFromCandidates(
-    Array.from(document.querySelectorAll('*')),
-    rect,
-    maxResults
-  );
-}
-
-export function collectAllElements(): Element[] {
-  return Array.from(document.querySelectorAll('*'));
+export function getElementsInRect(
+  rect: { left: number; top: number; width: number; height: number },
+  maxResults = 10
+): Element[] {
+  return getElementsInRectFromCandidates(collectAllElements(), rect, maxResults);
 }
 
 export function getElementsInRectFromCandidates(
@@ -172,8 +219,14 @@ export function getElementsInRectFromCandidates(
     if (el.closest('.tian-annotate-ignore')) continue;
     const r = el.getBoundingClientRect();
     if (r.width < 1 || r.height < 1) continue;
-    const overlapX = Math.max(0, Math.min(r.right, rect.left + rect.width) - Math.max(r.left, rect.left));
-    const overlapY = Math.max(0, Math.min(r.bottom, rect.top + rect.height) - Math.max(r.top, rect.top));
+    const overlapX = Math.max(
+      0,
+      Math.min(r.right, rect.left + rect.width) - Math.max(r.left, rect.left)
+    );
+    const overlapY = Math.max(
+      0,
+      Math.min(r.bottom, rect.top + rect.height) - Math.max(r.top, rect.top)
+    );
     const overlapArea = overlapX * overlapY;
     if (overlapArea <= 0) continue;
     if (overlapArea / (r.width * r.height) < MIN_CONTAINMENT_RATIO) continue;
@@ -217,12 +270,23 @@ export function getUnionRect(els: Element[]): Rect {
   };
 }
 
-const INTERACTIVE_TAGS = new Set(['a', 'button', 'input', 'select', 'textarea', 'img', 'video', 'audio', 'label']);
+const INTERACTIVE_TAGS = new Set([
+  'a',
+  'button',
+  'input',
+  'select',
+  'textarea',
+  'img',
+  'video',
+  'audio',
+  'label',
+]);
 const SVG_NS = 'http://www.w3.org/2000/svg';
 
 function hasVisualIdentity(el: Element): boolean {
   const cs = window.getComputedStyle(el);
-  const hasBackground = cs.backgroundImage !== 'none' || !/^rgba?\(0,\s*0,\s*0,\s*0\)$/.test(cs.backgroundColor);
+  const hasBackground =
+    cs.backgroundImage !== 'none' || !/^rgba?\(0,\s*0,\s*0,\s*0\)$/.test(cs.backgroundColor);
   const hasBorder = (['Top', 'Right', 'Bottom', 'Left'] as const).some((side) => {
     const width = parseFloat(cs[`border${side}Width` as keyof CSSStyleDeclaration] as string);
     return width > 0 && cs[`border${side}Style` as keyof CSSStyleDeclaration] !== 'none';
@@ -270,8 +334,14 @@ export function getMeaningfulTarget(
   // Collapse icon-fragment nodes (<path>, <circle>, <g>, ...) up to the
   // enclosing <svg> — those fragments are never meaningful on their own.
   let start: Element = el;
-  while (start.namespaceURI === SVG_NS && start.tagName.toLowerCase() !== 'svg' && start.parentElement) {
-    start = start.parentElement;
+  while (start.namespaceURI === SVG_NS && start.tagName.toLowerCase() !== 'svg') {
+    const parent =
+      start.parentElement ||
+      ((start.getRootNode() instanceof ShadowRoot
+        ? (start.getRootNode() as ShadowRoot).host
+        : null) as Element | null);
+    if (!parent) break;
+    start = parent;
   }
 
   let candidate = start;
@@ -289,7 +359,11 @@ export function getMeaningfulTarget(
       if (!preferContainer) return candidate;
       if (!textFallback) textFallback = candidate;
     }
-    const parent = candidate.parentElement;
+    let parent: Element | null = candidate.parentElement;
+    if (!parent) {
+      const root = candidate.getRootNode();
+      parent = (root instanceof ShadowRoot ? root.host : null) as Element | null;
+    }
     if (!parent || parent === document.body || parent === document.documentElement) break;
     candidate = parent;
     depth++;

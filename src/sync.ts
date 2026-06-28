@@ -5,7 +5,7 @@
 // unreachable/offline backend must never break local annotating, same
 // philosophy as the localStorage persistence in store.ts.
 
-import type { Annotation, ThreadMessage } from './types';
+import type { Annotation } from './types';
 
 function url(endpoint: string, path: string): string {
   return `${endpoint.replace(/\/$/, '')}${path}`;
@@ -34,22 +34,6 @@ export async function syncUpdate(
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(patch),
-    });
-  } catch {
-    /* best-effort */
-  }
-}
-
-export async function syncThreadMessage(
-  endpoint: string,
-  id: string,
-  message: Omit<ThreadMessage, 'id' | 'timestamp'>
-): Promise<void> {
-  try {
-    await fetch(url(endpoint, `/api/annotations/${id}/thread`), {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(message),
     });
   } catch {
     /* best-effort */
@@ -101,10 +85,7 @@ export async function fetchAgentModels(
   }
 }
 
-export async function fetchAnnotations(
-  endpoint: string,
-  sessionId: string
-): Promise<Annotation[]> {
+export async function fetchAnnotations(endpoint: string, sessionId: string): Promise<Annotation[]> {
   try {
     const res = await fetch(
       url(endpoint, `/api/annotations?sessionId=${encodeURIComponent(sessionId)}`)

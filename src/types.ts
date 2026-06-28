@@ -60,7 +60,7 @@ export type Annotation = {
 
   // Annotation kind (layout-mode fields are typed for forward-compatibility;
   // the UI currently only produces "feedback" kind annotations — see README)
-  kind?: 'feedback' | 'placement' | 'rearrange';
+  kind?: 'feedback' | 'placement' | 'rearrange' | 'area';
 
   placement?: {
     componentType: string;
@@ -76,6 +76,11 @@ export type Annotation = {
     tagName: string;
     originalRect: Rect;
     currentRect: Rect;
+  };
+
+  area?: {
+    rect: Rect;
+    scrollY: number;
   };
 
   // Lifecycle

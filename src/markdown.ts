@@ -5,7 +5,11 @@ function line(label: string, value?: string | number | boolean): string | null {
   return `**${label}:** ${value}`;
 }
 
-export function formatAnnotation(a: Annotation, index: number, format: OutputFormat = 'standard'): string {
+export function formatAnnotation(
+  a: Annotation,
+  index: number,
+  format: OutputFormat = 'standard'
+): string {
   const lines: (string | null)[] = [];
 
   if (a.kind === 'placement') {
@@ -13,6 +17,9 @@ export function formatAnnotation(a: Annotation, index: number, format: OutputFor
   }
   if (a.kind === 'rearrange') {
     return formatRearrange(a, index, format);
+  }
+  if (a.kind === 'area') {
+    return formatArea(a, index, format);
   }
 
   lines.push(`## Annotation #${index}`);
@@ -84,15 +91,25 @@ function formatPlacement(a: Annotation, index: number, format: OutputFormat): st
   return lines.filter((l): l is string => l !== null).join('\n');
 }
 
-function formatRearrange(a: Annotation, index: number, format: OutputFormat): string {
+function formatRearrange(a: Annotation, index: number, _format: OutputFormat): string {
   const lines: (string | null)[] = [`## Annotation #${index} (Rearrange)`];
   const r = a.rearrange;
 
   if (r) {
     lines.push(line('Element', r.label));
     lines.push(line('Selector', r.selector));
-    lines.push(line('Original position', `${r.originalRect.x}px, ${r.originalRect.y}px (${r.originalRect.width}×${r.originalRect.height}px)`));
-    lines.push(line('Proposed position', `${r.currentRect.x}px, ${r.currentRect.y}px (${r.currentRect.width}×${r.currentRect.height}px)`));
+    lines.push(
+      line(
+        'Original position',
+        `${r.originalRect.x}px, ${r.originalRect.y}px (${r.originalRect.width}×${r.originalRect.height}px)`
+      )
+    );
+    lines.push(
+      line(
+        'Proposed position',
+        `${r.currentRect.x}px, ${r.currentRect.y}px (${r.currentRect.width}×${r.currentRect.height}px)`
+      )
+    );
   }
 
   lines.push(line('Feedback', a.comment));
@@ -102,6 +119,35 @@ function formatRearrange(a: Annotation, index: number, format: OutputFormat): st
   return lines.filter((l): l is string => l !== null).join('\n');
 }
 
-export function serializeAnnotations(annotations: Annotation[], format: OutputFormat = 'standard'): string {
+function formatArea(a: Annotation, index: number, format: OutputFormat): string {
+  const lines: (string | null)[] = [`## Annotation #${index} (Area)`];
+  const area = a.area;
+
+  if (area) {
+    lines.push(
+      line(
+        'Region',
+        `${area.rect.x}px, ${area.rect.y}px (${area.rect.width}×${area.rect.height}px)`
+      )
+    );
+    lines.push(line('Scroll position', `${area.scrollY}px`));
+  }
+
+  if (format !== 'compact') {
+    lines.push(line('Position (relative)', a.boundingBox ? `${a.x}%, ${a.y}px` : undefined));
+    if (a.url) lines.push(line('URL', a.url));
+  }
+
+  lines.push(line('Feedback', a.comment));
+  lines.push(line('Intent', a.intent));
+  lines.push(line('Severity', a.severity));
+
+  return lines.filter((l): l is string => l !== null).join('\n');
+}
+
+export function serializeAnnotations(
+  annotations: Annotation[],
+  format: OutputFormat = 'standard'
+): string {
   return annotations.map((a, i) => formatAnnotation(a, i + 1, format)).join('\n\n');
 }

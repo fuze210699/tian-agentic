@@ -66,18 +66,55 @@ src/
 demo/                minimal Vite + Vue app exercising the component
 ```
 
-## Not implemented
+## Props
 
-- **Backend sync (API / webhooks / realtime push)** — out of scope here;
-  this package only produces annotation data client-side. Point your own
-  backend at the `annotations` array from `useTianAnnotateStore()` if you
-  want to sync it elsewhere. The `AnnotationEvent` type in `src/types.ts`
-  is provided for anyone wiring up that kind of sync layer.
-- **Layout mode** (`kind: "placement" | "rearrange"`) — typed in
-  `types.ts` for forward-compatibility, but the UI only creates `"feedback"`
-  annotations.
-- **Multi-select / drag-area selection** — single-element click only.
-- **Animation pause** — not implemented.
+| Prop                     | Type                                                  | Default      | Description                                                        |
+| ------------------------ | ----------------------------------------------------- | ------------ | ------------------------------------------------------------------ |
+| `defaultFormat`          | `'compact' \| 'standard' \| 'detailed' \| 'forensic'` | `'standard'` | Default markdown detail level                                      |
+| `pauseAnimations`        | `boolean`                                             | `true`       | Pause page animations when annotation mode is active               |
+| `persistKey`             | `string`                                              | —            | localStorage key for persisting annotations across reloads         |
+| `enableLayoutMode`       | `boolean`                                             | `false`      | Enable placement/rearrange layout modes                            |
+| `syncEndpoint`           | `string`                                              | —            | Base URL of a tian-agentic-be instance for backend sync            |
+| `syncSessionId`          | `string`                                              | —            | Groups annotations server-side per session                         |
+| `accentColor`            | `string`                                              | `'#6366f1'`  | Custom accent color for outlines, buttons, and pins                |
+| `blockInteractionOnCopy` | `boolean`                                             | `false`      | Block page interaction briefly after copy                          |
+| `copyToClipboard`        | `boolean`                                             | `true`       | When `false`, Copy emits `copy` event instead of writing clipboard |
+
+## Emits
+
+| Event               | Payload                                      | Description                                    |
+| ------------------- | -------------------------------------------- | ---------------------------------------------- |
+| `annotation-add`    | `Annotation`                                 | Fired when a new annotation is created         |
+| `annotation-delete` | `string` (id)                                | Fired when an annotation is deleted            |
+| `annotation-update` | `{ id: string, patch: Partial<Annotation> }` | Fired when an annotation is updated            |
+| `annotations-clear` | —                                            | Fired when all annotations are cleared         |
+| `copy`              | `string` (markdown)                          | Fired when Copy is triggered                   |
+| `session-created`   | `string` (sessionId)                         | Fired when a sync session is first established |
+
+## Keyboard shortcuts
+
+Only active when the toolbar is active (except `Ctrl/Cmd+Shift+F`).
+
+| Shortcut           | Action                                               |
+| ------------------ | ---------------------------------------------------- |
+| `Ctrl/Cmd+Shift+F` | Toggle annotation mode on/off                        |
+| `Esc`              | Close popup/modal, or exit annotation mode           |
+| `P`                | Pause/resume page animations                         |
+| `H`                | Show/hide annotation pins                            |
+| `C`                | Copy annotations as markdown                         |
+| `X`                | Clear all annotations                                |
+| `L`                | Cycle layout mode (feedback → placement → rearrange) |
+
+Shortcuts are disabled when typing in input fields, textareas, or contenteditable elements.
+
+## Annotation kinds
+
+| Kind        | Description                                                     |
+| ----------- | --------------------------------------------------------------- |
+| `feedback`  | Standard annotation on an element or multi-select group         |
+| `area`      | Annotation on a drag-selected empty region (no elements inside) |
+| `placement` | Propose a new component at a location                           |
+| `rearrange` | Propose moving an existing element                              |
 
 ## Build
 
