@@ -2,12 +2,13 @@ import { defineConfig } from 'vite';
 import vue from '@vitejs/plugin-vue';
 import dts from 'vite-plugin-dts';
 import { resolve } from 'path';
+import { tianAnnotate } from 'tian-vue-annotate/vite';
 
 export default defineConfig(({ command }) => {
   if (command === 'serve') {
     return {
       root: 'demo',
-      plugins: [vue()],
+      plugins: [vue(), tianAnnotate()],
     };
   }
   return {
@@ -15,8 +16,8 @@ export default defineConfig(({ command }) => {
     build: {
       lib: {
         entry: resolve(__dirname, 'src/index.ts'),
-        name: 'TianAnnotateVue',
-        fileName: (format) => `tian-annotate-vue.${format === 'es' ? 'es.js' : 'umd.cjs'}`,
+        name: 'TianVueAnnotate',
+        fileName: (format) => `tian-vue-annotate.${format === 'es' ? 'es.js' : 'umd.cjs'}`,
       },
       rollupOptions: {
         external: ['vue'],

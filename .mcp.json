@@ -1,0 +1,21 @@
+{
+  "mcpServers": {
+    "milens": {
+      "type": "stdio",
+      "command": "milens",
+      "args": [
+        "serve",
+        "-p",
+        "."
+      ]
+    },
+    "tian-annotate": {
+      "type": "stdio",
+      "command": "npx",
+      "args": [
+        "tian-vue-annotate-server",
+        "mcp"
+      ]
+    }
+  }
+}

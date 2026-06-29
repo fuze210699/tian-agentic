@@ -1,0 +1,61 @@
+---
+name: milens-orchestrator
+description: Code intelligence for the orchestrator area — symbols, dependencies, and entry points
+---
+
+# Orchestrator
+
+## Working with this area
+When working with code in **orchestrator/**, follow these mandatory safety rules:
+
+### Before editing any symbol in this area:
+1. Call `mcp_milens_impact({target: "<symbol>", repo: "<workspaceRoot>"})` — check blast radius
+2. If depth-1 dependents > 5 → **STOP and warn** before proceeding
+3. Call `mcp_milens_context({name: "<symbol>", repo: "<workspaceRoot>"})` — see all callers/callees
+
+### Before committing changes in this area:
+1. Call `mcp_milens_detect_changes({repo: "<workspaceRoot>"})` — verify scope
+2. If unexpected files changed → **STOP and report**
+
+### Key tools for this area:
+| Task | Tool |
+|---|---|
+| Find all references | `mcp_milens_context` |
+| Check edit safety | `mcp_milens_edit_check` |
+| Text search across files | `mcp_milens_grep` |
+| See file symbols | `mcp_milens_get_file_symbols` |
+
+## Overview
+Contains 22 symbols (7 exported) across 2 files.
+
+## Key Symbols
+- **`Orchestrator`** [class] (src/orchestrator/orchestrator.ts:36) — 6 refs
+- **`OrchestratorReport`** [interface] (src/orchestrator/reporter.ts:4) — 5 refs
+- **`formatReport`** [function] (src/orchestrator/reporter.ts:17) — 4 refs
+- **`OrchestratorConfig`** [interface] (src/orchestrator/orchestrator.ts:10) — 2 refs
+- **`ImpactSnapshot`** [interface] (src/orchestrator/orchestrator.ts:18) — 2 refs
+- **`ReportOptions`** [interface] (src/orchestrator/reporter.ts:13) — 2 refs
+- **`ImpactDiff`** [interface] (src/orchestrator/orchestrator.ts:25) — 1 refs
+
+## Entry Points
+- **`Orchestrator`** [class] — 6 incoming references
+- **`e`** [function] — 5 incoming references
+- **`OrchestratorReport`** [interface] — 5 incoming references
+- **`formatReport`** [function] — 4 incoming references
+- **`snapshot`** [method] — 3 incoming references
+
+## Dependencies
+- **store**: `Database`, `findSymbolByName`, `findUpstream`, `clear`, `getTestCoverageGaps`, `findDeadCode`, `close`
+- **analyzer**: `reviewPr`, `ReviewResult`, `SymbolRisk`
+- **root**: `CodeSymbol`, `has`
+- **test**: `add`
+
+## Used By
+- **root**: `Orchestrator`, `subscribe`, `runAndFormat`
+- **server**: `Orchestrator`, `loadSnapshots`, `snapshot`, `persistSnapshots`, `compare`, `runAndFormat`
+- **test**: `Orchestrator`, `formatReport`, `OrchestratorReport`, `subscribe`, `run`, `snapshot`, `compare`, `cancel` (+3 more)
+- **apps**: `e`
+
+## Files
+- src/orchestrator/orchestrator.ts
+- src/orchestrator/reporter.ts

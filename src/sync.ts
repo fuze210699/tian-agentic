@@ -1,7 +1,6 @@
 // src/sync.ts
 //
-// Best-effort HTTP bridge to a tian-agentic-be instance (see
-// d:\project\tian-agentic-be). All functions swallow network errors — an
+// Best-effort HTTP bridge to a tian-agentic-be instance. All functions swallow network errors — an
 // unreachable/offline backend must never break local annotating, same
 // philosophy as the localStorage persistence in store.ts.
 
@@ -82,6 +81,20 @@ export async function fetchAgentModels(
     return { models: Array.isArray(data?.models) ? data.models : [], error: data?.error };
   } catch (err) {
     return { models: [], error: err instanceof Error ? err.message : 'Network error' };
+  }
+}
+
+export async function fetchHealth(
+  endpoint: string
+): Promise<{ defaultAgent: 'claude' | 'opencode' | null }> {
+  try {
+    const res = await fetch(url(endpoint, '/api/health'));
+    if (!res.ok) return { defaultAgent: null };
+    const data = await res.json();
+    const agent = data?.defaultAgent;
+    return { defaultAgent: agent === 'claude' || agent === 'opencode' ? agent : null };
+  } catch {
+    return { defaultAgent: null };
   }
 }
 

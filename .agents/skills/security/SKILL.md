@@ -1,0 +1,67 @@
+---
+name: milens-security
+description: Code intelligence for the security area — symbols, dependencies, and entry points
+---
+
+# Security
+
+## Working with this area
+When working with code in **security/**, follow these mandatory safety rules:
+
+### Before editing any symbol in this area:
+1. Call `mcp_milens_impact({target: "<symbol>", repo: "<workspaceRoot>"})` — check blast radius
+2. If depth-1 dependents > 5 → **STOP and warn** before proceeding
+3. Call `mcp_milens_context({name: "<symbol>", repo: "<workspaceRoot>"})` — see all callers/callees
+
+### Before committing changes in this area:
+1. Call `mcp_milens_detect_changes({repo: "<workspaceRoot>"})` — verify scope
+2. If unexpected files changed → **STOP and report**
+
+### Key tools for this area:
+| Task | Tool |
+|---|---|
+| Find all references | `mcp_milens_context` |
+| Check edit safety | `mcp_milens_edit_check` |
+| Text search across files | `mcp_milens_grep` |
+| See file symbols | `mcp_milens_get_file_symbols` |
+
+## Overview
+Contains 44 symbols (15 exported) across 2 files.
+
+## Key Symbols
+- **`loadRules`** [function] (src/security/rules.ts:1301) — 6 refs
+- **`auditDependencies`** [function] (src/security/deps.ts:732) — 4 refs
+- **`detectEcosystem`** [function] (src/security/deps.ts:512) — 3 refs
+- **`parseDependencies`** [function] (src/security/deps.ts:524) — 3 refs
+- **`checkVulnerabilities`** [function] (src/security/deps.ts:687) — 3 refs
+- **`Ecosystem`** [type] (src/security/deps.ts:8) — 3 refs
+- **`VulnerabilityReport`** [interface] (src/security/deps.ts:26) — 2 refs
+- **`getRulesByCategory`** [function] (src/security/rules.ts:1308) — 2 refs
+- **`getRulesBySeverity`** [function] (src/security/rules.ts:1312) — 2 refs
+- **`SecurityCategory`** [type] (src/security/rules.ts:3) — 1 refs
+- **`Dependency`** [interface] (src/security/deps.ts:10) — 0 refs
+- **`Vulnerability`** [interface] (src/security/deps.ts:16) — 0 refs
+- **`SecurityRule`** [interface] (src/security/rules.ts:31) — 0 refs
+- **`SecurityMatch`** [interface] (src/security/rules.ts:47) — 0 refs
+- **`SecurityReport`** [interface] (src/security/rules.ts:59) — 0 refs
+
+## Entry Points
+- **`readManifest`** [function] — 6 incoming references
+- **`loadRules`** [function] — 6 incoming references
+- **`auditDependencies`** [function] — 4 incoming references
+- **`detectEcosystem`** [function] — 3 incoming references
+- **`parseDependencies`** [function] — 3 incoming references
+
+## Dependencies
+- **scripts**: `version`
+- **test**: `add`
+- **root**: `has`
+
+## Used By
+- **root**: `loadRules`, `auditDependencies`
+- **server**: `loadRules`
+- **test**: `detectEcosystem`, `parseDependencies`, `checkVulnerabilities`, `auditDependencies`, `loadRules`, `getRulesByCategory`, `getRulesBySeverity`
+
+## Files
+- src/security/deps.ts
+- src/security/rules.ts

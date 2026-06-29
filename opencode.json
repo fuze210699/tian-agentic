@@ -3,7 +3,7 @@
   "mcp": {
     "tian-annotate": {
       "type": "local",
-      "command": ["node", "D:/project/tian-agentic-be/dist/index.js", "mcp"]
+      "command": ["npx", "tian-agentic-be", "mcp"]
     }
   }
 }

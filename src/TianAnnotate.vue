@@ -20,7 +20,7 @@ import {
 import { getVueInstance, getComponentTree, getSourceFile } from './vueTree';
 import { serializeAnnotations } from './markdown';
 import { COMPONENT_PALETTE } from './componentPalette';
-import { dispatchAgent as dispatchAgentRequest, fetchAgentModels } from './sync';
+import { dispatchAgent as dispatchAgentRequest, fetchAgentModels, fetchHealth } from './sync';
 import type { Annotation, OutputFormat, Rect, ThreadMessage } from './types';
 import claudeLogo from './assets/logos/claude-color.svg?raw';
 import opencodeLogo from './assets/logos/opencode.svg?raw';
@@ -328,6 +328,7 @@ const editingComment = ref(false);
 const editCommentText = ref('');
 const dispatching = ref<'claude' | 'opencode' | null>(null);
 const dispatchError = ref('');
+const defaultAgent = ref<'claude' | 'opencode' | null>(null);
 
 const dragStart = ref<{ x: number; y: number } | null>(null);
 const dragRect = ref<Rect | null>(null);
@@ -1354,6 +1355,11 @@ onMounted(() => {
   window.addEventListener('blur', onWindowBlur);
   window.addEventListener('resize', onWindowResize);
   startSync();
+  if (props.syncEndpoint) {
+    fetchHealth(props.syncEndpoint).then((r) => {
+      defaultAgent.value = r.defaultAgent;
+    });
+  }
   if (
     props.syncEndpoint &&
     props.syncSessionId &&
@@ -2142,7 +2148,7 @@ onBeforeUnmount(() => {
               <button
                 type="button"
                 class="tian-annotate-btn-dispatch tian-annotate-btn-dispatch--icon"
-                :class="{ 'is-loading': dispatching === 'claude' }"
+                :class="{ 'is-loading': dispatching === 'claude', 'is-default': defaultAgent === 'claude' }"
                 :disabled="!!dispatching || selectedAnnotation.status === 'resolved'"
                 :aria-label="dispatching === 'claude' ? 'Starting Claude…' : 'Fix with Claude'"
                 :title="dispatching === 'claude' ? 'Starting Claude…' : 'Fix with Claude'"
@@ -2154,7 +2160,7 @@ onBeforeUnmount(() => {
               <button
                 type="button"
                 class="tian-annotate-btn-dispatch tian-annotate-btn-dispatch--icon"
-                :class="{ 'is-loading': dispatching === 'opencode' }"
+                :class="{ 'is-loading': dispatching === 'opencode', 'is-default': defaultAgent === 'opencode' }"
                 :disabled="!!dispatching || selectedAnnotation.status === 'resolved'"
                 :aria-label="
                   dispatching === 'opencode' ? 'Starting OpenCode…' : 'Fix with OpenCode'
@@ -3310,6 +3316,14 @@ html.tian-annotate-no-select * {
 .tian-annotate-btn-dispatch.is-loading .tian-annotate-spinner {
   border-color: rgba(79, 70, 229, 0.2);
   border-top-color: #4f46e5;
+}
+.tian-annotate-btn-dispatch.is-default {
+  border-color: var(--tian-accent);
+  box-shadow: 0 0 0 2px rgba(99, 102, 241, 0.15);
+}
+.tian-annotate-btn-dispatch.is-default:hover:not(:disabled) {
+  border-color: var(--tian-accent);
+  background: #eef2ff;
 }
 
 /* Disabled link button */
